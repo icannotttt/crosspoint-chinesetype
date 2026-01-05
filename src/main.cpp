@@ -1,0 +1,329 @@
+#include <Arduino.h>
+#include <EInkDisplay.h>
+#include <Epub.h>
+#include <GfxRenderer.h>
+#include <InputManager.h>
+#include <SDCardManager.h>
+#include <SPI.h>
+#include <builtinFonts/all.h>
+
+#include "Battery.h"
+#include "CrossPointSettings.h"
+#include "CrossPointState.h"
+#include "MappedInputManager.h"
+#include "activities/boot_sleep/BootActivity.h"
+#include "activities/boot_sleep/SleepActivity.h"
+#include "activities/home/HomeActivity.h"
+#include "activities/network/CrossPointWebServerActivity.h"
+#include "activities/reader/ReaderActivity.h"
+#include "activities/settings/SettingsActivity.h"
+#include "activities/util/FullScreenMessageActivity.h"
+#include "fontIds.h"
+
+#define SPI_FQ 40000000
+// Display SPI pins (custom pins for XteinkX4, not hardware SPI defaults)
+#define EPD_SCLK 8   // SPI Clock
+#define EPD_MOSI 10  // SPI MOSI (Master Out Slave In)
+#define EPD_CS 21    // Chip Select
+#define EPD_DC 4     // Data/Command
+#define EPD_RST 5    // Reset
+#define EPD_BUSY 6   // Busy
+
+#define UART0_RXD 20  // Used for USB connection detection
+
+#define SD_SPI_MISO 7
+
+EInkDisplay einkDisplay(EPD_SCLK, EPD_MOSI, EPD_CS, EPD_DC, EPD_RST, EPD_BUSY);
+InputManager inputManager;
+MappedInputManager mappedInputManager(inputManager);
+GfxRenderer renderer(einkDisplay);
+Activity* currentActivity;
+
+// Fonts
+EpdFont bookerly12RegularFont(&bookerly_18_bold);
+EpdFont bookerly12BoldFont(&bookerly_18_bold);
+EpdFont bookerly12ItalicFont(&bookerly_18_bold);
+EpdFont bookerly12BoldItalicFont(&bookerly_18_bold);
+EpdFontFamily bookerly12FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+EpdFontFamily bookerly14FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+EpdFontFamily bookerly16FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+EpdFontFamily bookerly18FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+
+EpdFontFamily notosans12FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+EpdFontFamily notosans14FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+EpdFontFamily notosans16FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+EpdFontFamily notosans18FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+
+EpdFontFamily opendyslexic8FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+EpdFontFamily opendyslexic10FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+EpdFontFamily opendyslexic12FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+EpdFontFamily opendyslexic14FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
+                                   &bookerly12BoldItalicFont);
+
+EpdFont smallFont(&ubuntu_10_bold);
+EpdFontFamily smallFontFamily(&smallFont);
+
+EpdFont ui10RegularFont(&ubuntu_10_bold);
+EpdFont ui10BoldFont(&ubuntu_10_bold);
+EpdFontFamily ui10FontFamily(&ui10RegularFont, &ui10BoldFont);
+
+EpdFont ui12RegularFont(&ubuntu_10_bold);
+EpdFont ui12BoldFont(&ubuntu_10_bold);
+EpdFontFamily ui12FontFamily(&ui12RegularFont, &ui12BoldFont);
+
+// Auto-sleep timeout (10 minutes of inactivity)
+constexpr unsigned long AUTO_SLEEP_TIMEOUT_MS = 10 * 60 * 1000;
+// measurement of power button press duration calibration value
+unsigned long t1 = 0;
+unsigned long t2 = 0;
+
+void exitActivity() {
+  if (currentActivity) {
+    currentActivity->onExit();
+    delete currentActivity;
+    currentActivity = nullptr;
+  }
+}
+
+void enterNewActivity(Activity* activity) {
+  currentActivity = activity;
+  currentActivity->onEnter();
+}
+
+// Verify long press on wake-up from deep sleep
+void verifyWakeupLongPress() {
+  // Give the user up to 1000ms to start holding the power button, and must hold for SETTINGS.getPowerButtonDuration()
+  const auto start = millis();
+  bool abort = false;
+  // It takes us some time to wake up from deep sleep, so we need to subtract that from the duration
+  uint16_t calibration = 29;
+  uint16_t calibratedPressDuration =
+      (calibration < SETTINGS.getPowerButtonDuration()) ? SETTINGS.getPowerButtonDuration() - calibration : 1;
+
+  inputManager.update();
+  // Verify the user has actually pressed
+  while (!inputManager.isPressed(InputManager::BTN_POWER) && millis() - start < 1000) {
+    delay(10);  // only wait 10ms each iteration to not delay too much in case of short configured duration.
+    inputManager.update();
+  }
+
+  t2 = millis();
+  if (inputManager.isPressed(InputManager::BTN_POWER)) {
+    do {
+      delay(10);
+      inputManager.update();
+    } while (inputManager.isPressed(InputManager::BTN_POWER) && inputManager.getHeldTime() < calibratedPressDuration);
+    abort = inputManager.getHeldTime() < calibratedPressDuration;
+  } else {
+    abort = true;
+  }
+
+  if (abort) {
+    // Button released too early. Returning to sleep.
+    // IMPORTANT: Re-arm the wakeup trigger before sleeping again
+    esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+    esp_deep_sleep_start();
+  }
+}
+
+void waitForPowerRelease() {
+  inputManager.update();
+  while (inputManager.isPressed(InputManager::BTN_POWER)) {
+    delay(50);
+    inputManager.update();
+  }
+}
+
+// Enter deep sleep mode
+void enterDeepSleep() {
+  exitActivity();
+  enterNewActivity(new SleepActivity(renderer, mappedInputManager));
+
+  einkDisplay.deepSleep();
+  Serial.printf("[%lu] [   ] Power button press calibration value: %lu ms\n", millis(), t2 - t1);
+  Serial.printf("[%lu] [   ] Entering deep sleep.\n", millis());
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+  // Ensure that the power button has been released to avoid immediately turning back on if you're holding it
+  waitForPowerRelease();
+  // Enter Deep Sleep
+  esp_deep_sleep_start();
+}
+
+void onGoHome();
+void onGoToReader(const std::string& initialEpubPath) {
+  exitActivity();
+  enterNewActivity(new ReaderActivity(renderer, mappedInputManager, initialEpubPath, onGoHome));
+}
+void onGoToReaderHome() { onGoToReader(std::string()); }
+void onContinueReading() { onGoToReader(APP_STATE.openEpubPath); }
+
+void onGoToFileTransfer() {
+  exitActivity();
+  enterNewActivity(new CrossPointWebServerActivity(renderer, mappedInputManager, onGoHome));
+}
+
+void onGoToSettings() {
+  exitActivity();
+  enterNewActivity(new SettingsActivity(renderer, mappedInputManager, onGoHome));
+}
+
+void onGoHome() {
+  exitActivity();
+  enterNewActivity(new HomeActivity(renderer, mappedInputManager, onContinueReading, onGoToReaderHome, onGoToSettings,
+                                    onGoToFileTransfer));
+}
+
+void setupDisplayAndFonts() {
+  einkDisplay.begin();
+  Serial.printf("[%lu] [   ] Display initialized\n", millis());
+  renderer.insertFont(BOOKERLY_12_FONT_ID, bookerly12FontFamily);
+  renderer.insertFont(BOOKERLY_14_FONT_ID, bookerly14FontFamily);
+  renderer.insertFont(BOOKERLY_16_FONT_ID, bookerly16FontFamily);
+  renderer.insertFont(BOOKERLY_18_FONT_ID, bookerly18FontFamily);
+  renderer.insertFont(NOTOSANS_12_FONT_ID, notosans12FontFamily);
+  renderer.insertFont(NOTOSANS_14_FONT_ID, notosans14FontFamily);
+  renderer.insertFont(NOTOSANS_16_FONT_ID, notosans16FontFamily);
+  renderer.insertFont(NOTOSANS_18_FONT_ID, notosans18FontFamily);
+  renderer.insertFont(OPENDYSLEXIC_8_FONT_ID, opendyslexic8FontFamily);
+  renderer.insertFont(OPENDYSLEXIC_10_FONT_ID, opendyslexic10FontFamily);
+  renderer.insertFont(OPENDYSLEXIC_12_FONT_ID, opendyslexic12FontFamily);
+  renderer.insertFont(OPENDYSLEXIC_14_FONT_ID, opendyslexic14FontFamily);
+  renderer.insertFont(UI_10_FONT_ID, ui10FontFamily);
+  renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
+  renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
+  Serial.printf("[%lu] [   ] Fonts setup\n", millis());
+}
+
+void setup() {
+  t1 = millis();
+
+  // Only start serial if USB connected
+  pinMode(UART0_RXD, INPUT);
+  if (digitalRead(UART0_RXD) == HIGH) {
+    Serial.begin(115200);
+  }
+
+  inputManager.begin();
+  // Initialize pins
+  pinMode(BAT_GPIO0, INPUT);
+
+  // Initialize SPI with custom pins
+  SPI.begin(EPD_SCLK, SD_SPI_MISO, EPD_MOSI, EPD_CS);
+
+  // SD Card Initialization
+  // We need 6 open files concurrently when parsing a new chapter
+  if (!SdMan.begin()) {
+    Serial.printf("[%lu] [   ] SD card initialization failed\n", millis());
+    setupDisplayAndFonts();
+    exitActivity();
+    enterNewActivity(new FullScreenMessageActivity(renderer, mappedInputManager, "SD card error", BOLD));
+    return;
+  }
+
+  SETTINGS.loadFromFile();
+
+  // verify power button press duration after we've read settings.
+  verifyWakeupLongPress();
+
+  // First serial output only here to avoid timing inconsistencies for power button press duration verification
+  Serial.printf("[%lu] [   ] Starting CrossPoint version " CROSSPOINT_VERSION "\n", millis());
+
+  setupDisplayAndFonts();
+
+  exitActivity();
+  enterNewActivity(new BootActivity(renderer, mappedInputManager));
+
+  APP_STATE.loadFromFile();
+  if (APP_STATE.openEpubPath.empty()) {
+    onGoHome();
+  } else {
+    // Clear app state to avoid getting into a boot loop if the epub doesn't load
+    const auto path = APP_STATE.openEpubPath;
+    APP_STATE.openEpubPath = "";
+    APP_STATE.saveToFile();
+    onGoToReader(path);
+  }
+
+  // Ensure we're not still holding the power button before leaving setup
+  waitForPowerRelease();
+}
+
+void loop() {
+  static unsigned long maxLoopDuration = 0;
+  const unsigned long loopStartTime = millis();
+  static unsigned long lastMemPrint = 0;
+
+  inputManager.update();
+
+  if (Serial && millis() - lastMemPrint >= 10000) {
+    Serial.printf("[%lu] [MEM] Free: %d bytes, Total: %d bytes, Min Free: %d bytes\n", millis(), ESP.getFreeHeap(),
+                  ESP.getHeapSize(), ESP.getMinFreeHeap());
+    lastMemPrint = millis();
+  }
+
+  // Check for any user activity (button press or release)
+  static unsigned long lastActivityTime = millis();
+  if (inputManager.wasAnyPressed() || inputManager.wasAnyReleased()) {
+    lastActivityTime = millis();  // Reset inactivity timer
+  }
+
+  if (millis() - lastActivityTime >= AUTO_SLEEP_TIMEOUT_MS) {
+    Serial.printf("[%lu] [SLP] Auto-sleep triggered after %lu ms of inactivity\n", millis(), AUTO_SLEEP_TIMEOUT_MS);
+    enterDeepSleep();
+    // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
+    return;
+  }
+
+  if (inputManager.isPressed(InputManager::BTN_POWER) &&
+      inputManager.getHeldTime() > SETTINGS.getPowerButtonDuration()) {
+    enterDeepSleep();
+    // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
+    return;
+  }
+
+  const unsigned long activityStartTime = millis();
+  if (currentActivity) {
+    currentActivity->loop();
+  }
+  const unsigned long activityDuration = millis() - activityStartTime;
+
+  const unsigned long loopDuration = millis() - loopStartTime;
+  if (loopDuration > maxLoopDuration) {
+    maxLoopDuration = loopDuration;
+    if (maxLoopDuration > 50) {
+      Serial.printf("[%lu] [LOOP] New max loop duration: %lu ms (activity: %lu ms)\n", millis(), maxLoopDuration,
+                    activityDuration);
+    }
+  }
+
+  // Add delay at the end of the loop to prevent tight spinning
+  // When an activity requests skip loop delay (e.g., webserver running), use yield() for faster response
+  // Otherwise, use longer delay to save power
+  if (currentActivity && currentActivity->skipLoopDelay()) {
+    yield();  // Give FreeRTOS a chance to run tasks, but return immediately
+  } else {
+    delay(10);  // Normal delay when no activity requires fast response
+  }
+}
