@@ -260,10 +260,11 @@ void setup() {
     onGoHome();
   } else {
     // Clear app state to avoid getting into a boot loop if the epub doesn't load
-    const auto path = APP_STATE.openEpubPath;
-    APP_STATE.openEpubPath = "";
-    APP_STATE.saveToFile();
-    onGoToReader(path);
+    //const auto path = APP_STATE.openEpubPath;
+   //APP_STATE.openEpubPath = "";
+    //APP_STATE.saveToFile();
+    //onGoToReader(path);
+    onGoHome();
   }
 
   // Ensure we're not still holding the power button before leaving setup
