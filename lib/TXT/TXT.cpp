@@ -570,7 +570,7 @@ std::string Txt::loadPageFromCache(uint32_t pageIdx) {
 // 核心加载方法（优化：不加载全量内容）
 bool Txt::load() {
     Serial.printf("[%lu] [TXT] Loading TXT: %s\n", millis(), filepath.c_str());
-    clearCache();
+    //clearCache();
 
     // 计算布局+总页数（按UTF-8字符数计算）
     calculatePageLayout();

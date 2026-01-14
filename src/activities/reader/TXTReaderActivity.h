@@ -16,22 +16,14 @@ class Section {
 public:
   int currentPage = 0;
   uint32_t pageCount = 0;
-  uint32_t beginbype=0; //动态分配
+  
   std::shared_ptr<Txt> txt;
 
   Section(std::shared_ptr<Txt> txtPtr) : txt(txtPtr) {
     pageCount = txt->getPageCount();
   }
 
-  // 2. 从txt读取
-  std::unique_ptr<std::string> loadPageFromSectionFile() {
-    if (currentPage < 0 || currentPage >= pageCount) {
-      return nullptr;
-    }
-    // 
-    std::string* content = new std::string(txt->getPage(beginbype));
-    return std::unique_ptr<std::string>(content);
-  }
+
   
 
   void clearCache() {}
@@ -48,6 +40,13 @@ class TXTReaderActivity final : public ActivityWithSubactivity {
   int currentChapterIndex = 0;                      
   int nextPageNumber = 0;
   int pagesUntilFullRefresh = 0;
+  uint32_t beginbype=0; //动态分配
+    // 2. 从txt读取
+  std::unique_ptr<std::string> loadPageFromSectionFile() {
+    // 
+    std::string* content = new std::string(txt->getPage(beginbype));
+    return std::unique_ptr<std::string>(content);
+  }
   bool updateRequired = false;
   const std::function<void()> onGoBack;
   const std::function<void()> onGoHome;
