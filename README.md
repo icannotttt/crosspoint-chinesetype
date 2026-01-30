@@ -57,6 +57,7 @@ intervals = [
 1. 需要一根typec线连接你的电脑和x4
 2. 下载release页面下的bin文件
 3. 打开 https://xteink.dve.al/ 页面，在OTA fast flash controls部分选择下载好的bin文件，点击flash firmware from file
+4. 先短按reset(sd卡附近），再长按电源键
 
 首次刷机建议做好保存，在full flash controls界面下，选择save full flash，备份一下你的官方固件
 
