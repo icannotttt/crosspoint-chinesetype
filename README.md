@@ -46,19 +46,43 @@ intervals = [
 
 ## 自选字体
 
-用户可以通过lib\EpdFont\scripts下的fontconvert.py进行字体转换，但是自选字体会耗费一定的内存，导致页面存储不了，所以只能半刷--参考官方2bit-xtc效果
+用户可以通过lib\EpdFont\scripts下的fontconvert.py进行字体转换，转换完后放入fonts/文件夹中，具体可见：[ruby-builds/crosspoint-reader (custom-fonts分支)](https://github.com/ruby-builds/crosspoint-reader/tree/feature/custom-fonts)
+
+但是自选字体会耗费一定的内存，导致页面存储不了，所以只能半刷--参考官方2bit-xtc效果
+
+## 刷机指导
+
+
+1. 需要一根typec线连接你的电脑和x4
+2. 下载release页面下的bin文件
+3. 打开 https://xteink.dve.al/ 页面，在OTA fast flash controls部分选择下载好的bin文件，点击flash firmware from file
+
+首次刷机建议做好保存，在full flash controls界面下，选择save full flash，备份一下你的官方固件
+
+
+
 
 # 主页
 主页自动生成封面，所以返回主页的时候时间会比较长，属于正常现象
 
 # bugs
-退出阅读界面的时候会有死机现象，长按电源键重启即可
+其他：退出阅读界面的时候会有死机现象，长按电源键重启即可
 
-epub阅读现仅支持打开前200章节，这部分预计半月内补全。
+其他：目录最好不要太长，现在识别目录字符串有限，建议绝对路径不要太长
 
-我现在有一个想法，但是这个想法目前死机频率有点高，所以先回退200章版本
+其他：书名最好不要包含空格及特殊符号，会有识别不到的风险
 
-xtc仅支持2bit版本，请注意，1bit版本现在测试有点问题，
+Epub: epub阅读现仅支持打开前200章节，这部分预计半月内补全。我现在有一个想法，但是这个想法目前死机频率有点高，所以先回退200章版本
+
+Epub: epub暂不支持长段落，会导致机器卡死
+
+Epub:大文件打开有问题，解压可能需要很久，暂不建议使用
+
+Epub: 打开epub最好等一会儿，这部分写的不如官方固件完整，耗时较长，而且第一次打不开不要紧，尝试3~5次，写入缓存成功后可以打开hhh
+
+XTC:xtc仅支持2bit版本，请注意，1bit版本现在测试有点问题，
+
+TXT：txt先仅支持阅读一段时间后向前翻页，点击打开不支持立即翻页，可以按确认键选择章节
 
 # 问题解决
 万事先重启
