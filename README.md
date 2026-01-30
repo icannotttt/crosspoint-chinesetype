@@ -61,7 +61,13 @@ intervals = [
 
 首次刷机建议做好保存，在full flash controls界面下，选择save full flash，备份一下你的官方固件
 
+# 文件管理
 
+复制粘贴需要时间，用的话需要等待会儿
+
+删除是长按confirm
+
+文件管理界面下方按键选择功能，侧边按键选择文件
 
 
 # 主页
