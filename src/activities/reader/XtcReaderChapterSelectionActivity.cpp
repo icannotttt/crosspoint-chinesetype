@@ -108,7 +108,7 @@ void XtcReaderChapterSelectionActivity::renderScreen() {
   }
 
   const auto pageWidth = renderer.getScreenWidth();
-  renderer.drawCenteredText(UI_12_FONT_ID, 15, "Select Chapter", true, EpdFontFamily::BOLD);
+  renderer.drawCenteredText(UI_12_FONT_ID, 15, "目录", true, EpdFontFamily::BOLD);
 
   const int FIX_LINE_HEIGHT = 29;
   const int BASE_Y = 60;
@@ -126,9 +126,16 @@ void XtcReaderChapterSelectionActivity::renderScreen() {
       title[sizeof(title)-1] = '\0';
       
       int drawY = BASE_Y + localIdx * FIX_LINE_HEIGHT; // ✅ 简化计算，逻辑正确
+      if (i == selectorIndex) {
+        renderer.fillRect(0, drawY, 480, FIX_LINE_HEIGHT);
+        renderer.drawText(UI_10_FONT_ID, 20, drawY, title, 0);
+      } else {
+        //renderer.drawRect(0, drawY, 480, FIX_LINE_HEIGHT);
+        renderer.drawText(UI_10_FONT_ID, 20, drawY, title, 1);
+      }
 
-      Serial.printf("选中的选项是：%d\n",selectorIndex); // ✅ 补全换行符，日志整洁
-      renderer.drawText(UI_10_FONT_ID, 20, drawY, title, i!= selectorIndex); // ✅ 核心修复：选中态正常，必加！
+      //Serial.printf("选中的选项是：%d\n",selectorIndex); // ✅ 补全换行符，日志整洁
+      //renderer.drawText(UI_10_FONT_ID, 20, drawY, title, i!= selectorIndex); // ✅ 核心修复：选中态正常，必加！
   }
 
   renderer.displayBuffer();
