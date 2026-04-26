@@ -1,0 +1,441 @@
+#include "CrossPointSettings.h"
+
+#include <HardwareSerial.h>
+#include <SDCardManager.h>
+#include <Serialization.h>
+
+#include <cstring>
+
+#include "fontIds.h"
+
+// Initialize the static instance
+CrossPointSettings CrossPointSettings::instance;
+
+void readAndValidate(FsFile& file, uint8_t& member, const uint8_t maxValue) {
+  uint8_t tempValue;
+  serialization::readPod(file, tempValue);
+  if (tempValue < maxValue) {
+    member = tempValue;
+  }
+}
+
+namespace {
+constexpr uint8_t SETTINGS_FILE_VERSION = 5;
+// 注意：如果修改了字段数量，需要同步更新这个值
+constexpr uint8_t SETTINGS_COUNT = 45;  // 增加1：新增sleepScreenCoverFilter
+constexpr char SETTINGS_FILE[] = "/.crosspoint/settings.bin";
+
+// Validate front button mapping to ensure each hardware button is unique.
+// If duplicates are detected, reset to the default physical order to prevent invalid mappings.
+void validateFrontButtonMapping(CrossPointSettings& settings) {
+  // Snapshot the logical->hardware mapping so we can compare for duplicates.
+  const uint8_t mapping[] = {settings.frontButtonBack, settings.frontButtonConfirm, settings.frontButtonLeft,
+                             settings.frontButtonRight};
+  for (size_t i = 0; i < 4; i++) {
+    for (size_t j = i + 1; j < 4; j++) {
+      if (mapping[i] == mapping[j]) {
+        // Duplicate detected: restore the default physical order (Back, Confirm, Left, Right).
+        settings.frontButtonBack = CrossPointSettings::FRONT_HW_BACK;
+        settings.frontButtonConfirm = CrossPointSettings::FRONT_HW_CONFIRM;
+        settings.frontButtonLeft = CrossPointSettings::FRONT_HW_LEFT;
+        settings.frontButtonRight = CrossPointSettings::FRONT_HW_RIGHT;
+        return;
+      }
+    }
+  }
+}
+
+// Convert legacy front button layout into explicit logical->hardware mapping.
+void applyLegacyFrontButtonLayout(CrossPointSettings& settings) {
+  switch (static_cast<CrossPointSettings::FRONT_BUTTON_LAYOUT>(settings.frontButtonLayout)) {
+    case CrossPointSettings::LEFT_RIGHT_BACK_CONFIRM:
+      settings.frontButtonBack = CrossPointSettings::FRONT_HW_LEFT;
+      settings.frontButtonConfirm = CrossPointSettings::FRONT_HW_RIGHT;
+      settings.frontButtonLeft = CrossPointSettings::FRONT_HW_BACK;
+      settings.frontButtonRight = CrossPointSettings::FRONT_HW_CONFIRM;
+      break;
+    case CrossPointSettings::LEFT_BACK_CONFIRM_RIGHT:
+      settings.frontButtonBack = CrossPointSettings::FRONT_HW_CONFIRM;
+      settings.frontButtonConfirm = CrossPointSettings::FRONT_HW_LEFT;
+      settings.frontButtonLeft = CrossPointSettings::FRONT_HW_BACK;
+      settings.frontButtonRight = CrossPointSettings::FRONT_HW_RIGHT;
+      break;
+    case CrossPointSettings::BACK_CONFIRM_RIGHT_LEFT:
+      settings.frontButtonBack = CrossPointSettings::FRONT_HW_BACK;
+      settings.frontButtonConfirm = CrossPointSettings::FRONT_HW_CONFIRM;
+      settings.frontButtonLeft = CrossPointSettings::FRONT_HW_RIGHT;
+      settings.frontButtonRight = CrossPointSettings::FRONT_HW_LEFT;
+      break;
+    case CrossPointSettings::BACK_CONFIRM_LEFT_RIGHT:
+    default:
+      settings.frontButtonBack = CrossPointSettings::FRONT_HW_BACK;
+      settings.frontButtonConfirm = CrossPointSettings::FRONT_HW_CONFIRM;
+      settings.frontButtonLeft = CrossPointSettings::FRONT_HW_LEFT;
+      settings.frontButtonRight = CrossPointSettings::FRONT_HW_RIGHT;
+      break;
+  }
+}
+}  // namespace
+
+bool CrossPointSettings::saveToFile() const {
+  // Make sure the directory exists
+  SdMan.mkdir("/.crosspoint");
+
+  FsFile outputFile;
+  if (!SdMan.openFileForWrite("CPS", SETTINGS_FILE, outputFile)) {
+    return false;
+  }
+
+  serialization::writePod(outputFile, SETTINGS_FILE_VERSION);
+  serialization::writePod(outputFile, SETTINGS_COUNT);
+  serialization::writePod(outputFile, sleepScreen);
+  serialization::writePod(outputFile, extraParagraphSpacing);
+  serialization::writePod(outputFile, shortPwrBtn);
+  serialization::writePod(outputFile, statusBar);
+  serialization::writePod(outputFile, orientation);
+  serialization::writePod(outputFile, frontButtonLayout);  // legacy
+  serialization::writePod(outputFile, sideButtonLayout);
+  serialization::writePod(outputFile, fontFamily);
+  serialization::writePod(outputFile, fontSize);
+  serialization::writePod(outputFile, lineSpacing);
+  serialization::writePod(outputFile, wordSpacing);
+  serialization::writePod(outputFile, firstlineintented);
+  serialization::writePod(outputFile, paragraphAlignment);
+  serialization::writePod(outputFile, sleepTimeout);
+  serialization::writePod(outputFile, refreshFrequency);
+  serialization::writePod(outputFile, screenMargin_Top);
+  serialization::writePod(outputFile, screenMargin_Bottom);
+  serialization::writePod(outputFile, screenMargin_Left);
+  serialization::writePod(outputFile, screenMargin_Right);
+  serialization::writePod(outputFile, sleepScreenCoverMode);
+  serialization::writeString(outputFile, std::string(opdsServerUrl));
+  serialization::writePod(outputFile, textAntiAliasing);
+  serialization::writePod(outputFile, hideBatteryPercentage);
+  serialization::writePod(outputFile, longPressChapterSkip);
+  serialization::writeString(outputFile, std::string(customFontFamily));
+  serialization::writePod(outputFile, customFontSize);
+  serialization::writePod(outputFile, hyphenationEnabled);
+  serialization::writeString(outputFile, std::string(opdsUsername));
+  serialization::writeString(outputFile, std::string(opdsPassword));
+  serialization::writeString(outputFile, std::string(jgBookFolder));
+  serialization::writeString(outputFile, std::string(jgUsername));
+  serialization::writeString(outputFile, std::string(jgAppPassword));
+  // 修复点1：新增sleepScreenCoverFilter的写入（和读取顺序对应）
+  serialization::writePod(outputFile, sleepScreenCoverFilter);
+  serialization::writePod(outputFile, uiTheme);
+  serialization::writePod(outputFile, frontButtonBack);
+  serialization::writePod(outputFile, frontButtonConfirm);
+  serialization::writePod(outputFile, frontButtonLeft);
+  serialization::writePod(outputFile, frontButtonRight);
+  serialization::writePod(outputFile, fadingFix);
+  serialization::writePod(outputFile, embeddedStyle);
+  serialization::writePod(outputFile, ReadingScreenEnabled);
+  serialization::writePod(outputFile, extraline);
+  //把蓝牙写上
+  serialization::writePod(outputFile, bluetoothEnabled );
+  // New fields added at end for backward compatibility
+  outputFile.close();
+
+  Serial.printf("[%lu] [CPS] Settings saved to file\n", millis());
+  return true;
+}
+
+bool CrossPointSettings::loadFromFile() {
+  FsFile inputFile;
+  if (!SdMan.openFileForRead("CPS", SETTINGS_FILE, inputFile)) {
+    return false;
+  }
+
+  uint8_t version;
+  serialization::readPod(inputFile, version);
+  if (version != SETTINGS_FILE_VERSION) {
+    Serial.printf("[%lu] [CPS] Deserialization failed: Unknown version %u\n", millis(), version);
+    inputFile.close();
+    return false;
+  }
+
+  uint8_t fileSettingsCount = 0;
+  serialization::readPod(inputFile, fileSettingsCount);
+
+  // load settings that exist (support older files with fewer fields)
+  uint8_t settingsRead = 0;
+  // Track whether remap fields were present in the settings file.
+  bool frontButtonMappingRead = false;
+  do {
+    readAndValidate(inputFile, sleepScreen, SLEEP_SCREEN_MODE_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, extraParagraphSpacing);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, shortPwrBtn, SHORT_PWRBTN_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, statusBar, STATUS_BAR_MODE_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, orientation, ORIENTATION_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, frontButtonLayout, FRONT_BUTTON_LAYOUT_COUNT);  // legacy
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, sideButtonLayout, SIDE_BUTTON_LAYOUT_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, fontFamily, FONT_FAMILY_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, fontSize, FONT_SIZE_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, lineSpacing, LINE_COMPRESSION_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, wordSpacing, WORD_COMPRESSION_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, firstlineintented);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, paragraphAlignment, PARAGRAPH_ALIGNMENT_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, sleepTimeout, SLEEP_TIMEOUT_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, refreshFrequency, REFRESH_FREQUENCY_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, screenMargin_Top);
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, screenMargin_Bottom);
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, screenMargin_Left);
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, screenMargin_Right);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, sleepScreenCoverMode, SLEEP_SCREEN_COVER_MODE_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    {
+      std::string urlStr;
+      serialization::readString(inputFile, urlStr);
+      strncpy(opdsServerUrl, urlStr.c_str(), sizeof(opdsServerUrl) - 1);
+      opdsServerUrl[sizeof(opdsServerUrl) - 1] = '\0';
+    }
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, textAntiAliasing);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, hideBatteryPercentage, HIDE_BATTERY_PERCENTAGE_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, longPressChapterSkip);
+    if (++settingsRead >= fileSettingsCount) break;
+    {
+      std::string fontStr;
+      serialization::readString(inputFile, fontStr);
+      strncpy(customFontFamily, fontStr.c_str(), sizeof(customFontFamily) - 1);
+      customFontFamily[sizeof(customFontFamily) - 1] = '\0';
+    }
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, customFontSize);
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, hyphenationEnabled);
+    if (++settingsRead >= fileSettingsCount) break;
+    {
+      std::string usernameStr;
+      serialization::readString(inputFile, usernameStr);
+      strncpy(opdsUsername, usernameStr.c_str(), sizeof(opdsUsername) - 1);
+      opdsUsername[sizeof(opdsUsername) - 1] = '\0';
+    }
+    if (++settingsRead >= fileSettingsCount) break;
+    {
+      std::string passwordStr;
+      serialization::readString(inputFile, passwordStr);
+      strncpy(opdsPassword, passwordStr.c_str(), sizeof(opdsPassword) - 1);
+      opdsPassword[sizeof(opdsPassword) - 1] = '\0';
+    }
+    if (++settingsRead >= fileSettingsCount) break;
+    {
+      std::string urlStr;
+      serialization::readString(inputFile, urlStr);
+      strncpy(jgBookFolder, urlStr.c_str(), sizeof(jgBookFolder) - 1);
+      jgBookFolder[sizeof(jgBookFolder) - 1] = '\0';
+    }
+    if (++settingsRead >= fileSettingsCount) break;
+    {
+      std::string usernameStr;
+      serialization::readString(inputFile, usernameStr);
+      strncpy(jgUsername, usernameStr.c_str(), sizeof(jgUsername) - 1);
+      jgUsername[sizeof(jgUsername) - 1] = '\0';
+    }
+    if (++settingsRead >= fileSettingsCount) break;
+    {
+      std::string passwordStr;
+      serialization::readString(inputFile, passwordStr);
+      strncpy(jgAppPassword, passwordStr.c_str(), sizeof(jgAppPassword) - 1);
+      jgAppPassword[sizeof(jgAppPassword) - 1] = '\0';
+    }
+    if (++settingsRead >= fileSettingsCount) break;
+    
+    // 修复点2：读取sleepScreenCoverFilter（和写入顺序对应）
+    serialization::readPod(inputFile, sleepScreenCoverFilter);
+    if (++settingsRead >= fileSettingsCount) break;
+    
+    // 修复点3：uiTheme读取位置修正（原代码位置错误导致后续字段错位）
+    serialization::readPod(inputFile, uiTheme);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, frontButtonBack, FRONT_BUTTON_HARDWARE_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, frontButtonConfirm, FRONT_BUTTON_HARDWARE_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, frontButtonLeft, FRONT_BUTTON_HARDWARE_COUNT);
+    if (++settingsRead >= fileSettingsCount) break;
+    readAndValidate(inputFile, frontButtonRight, FRONT_BUTTON_HARDWARE_COUNT);
+    frontButtonMappingRead = true;
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, fadingFix);
+    if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, embeddedStyle);
+    if (++settingsRead >= fileSettingsCount) break;
+    //新加阅读背景
+    serialization::readPod(inputFile, ReadingScreenEnabled);
+    if (++settingsRead >= fileSettingsCount) break;
+    //新加划线功能
+    serialization::readPod(inputFile, extraline);
+    if (++settingsRead >= fileSettingsCount) break;
+        //新加蓝牙功能
+    serialization::readPod(inputFile, bluetoothEnabled);
+    if (++settingsRead >= fileSettingsCount) break;
+    // New fields added at end for backward compatibility
+  } while (false);
+
+  if (frontButtonMappingRead) {
+    validateFrontButtonMapping(*this);
+  } else {
+    applyLegacyFrontButtonLayout(*this);
+  }
+
+  inputFile.close();
+  Serial.printf("[%lu] [CPS] Settings loaded from file\n", millis());
+  return true;
+}
+
+float CrossPointSettings::getReaderLineCompression() const {
+  switch (fontFamily) {
+    case BOOKERLY:
+    default:
+      switch (lineSpacing) {
+        case TIGHT:
+          return 0.8f;
+        case NORMAL:
+        default:
+          return 1.0f;
+        case WIDE:
+          return 1.2f;
+      }
+    case NOTOSANS:
+      switch (lineSpacing) {
+        case TIGHT:
+          return 0.90f;
+        case NORMAL:
+        default:
+          return 0.95f;
+        case WIDE:
+          return 1.0f;
+      }
+    case OPENDYSLEXIC:
+      switch (lineSpacing) {
+        case TIGHT:
+          return 0.90f;
+        case NORMAL:
+        default:
+          return 0.95f;
+        case WIDE:
+          return 1.0f;
+      }
+  }
+}
+
+unsigned long CrossPointSettings::getSleepTimeoutMs() const {
+  switch (sleepTimeout) {
+    case SLEEP_1_MIN:
+      return 1UL * 60 * 1000;
+    case SLEEP_5_MIN:
+      return 5UL * 60 * 1000;
+    case SLEEP_10_MIN:
+    default:
+      return 10UL * 60 * 1000;
+    case SLEEP_15_MIN:
+      return 15UL * 60 * 1000;
+    case SLEEP_30_MIN:
+      return 30UL * 60 * 1000;
+  }
+}
+
+int CrossPointSettings::getRefreshFrequency() const {
+  switch (refreshFrequency) {
+    case REFRESH_1:
+      return 1;
+    case REFRESH_5:
+      return 5;
+    case REFRESH_10:
+      return 10;
+    case REFRESH_15:
+    default:
+      return 15;
+    case REFRESH_30:
+      return 30;
+  }
+}
+#include <EpdFontLoader.h>
+int CrossPointSettings::getReaderFontId() const {
+
+  if (fontFamily == FONT_CUSTOM) {
+    uint8_t targetSize = customFontSize;
+    if (targetSize == 0) {
+      switch (fontSize) {
+        case SMALL:
+          targetSize = 12;
+          break;
+        case MEDIUM:
+        default:
+          targetSize = 14;
+          break;
+        case LARGE:
+          targetSize = 16;
+          break;
+        case EXTRA_LARGE:
+          targetSize = 18;
+          break;
+      }
+    }
+    int id = EpdFontLoader::getBestFontId(customFontFamily, targetSize);
+    if (id != -1) return id;
+    // Fallback if custom font not found
+  }
+
+  switch (fontFamily) {
+    case BOOKERLY:
+    default:
+      switch (fontSize) {
+        case SMALL:
+          return BOOKERLY_12_FONT_ID;
+        case MEDIUM:
+        default:
+          return BOOKERLY_14_FONT_ID;
+        case LARGE:
+          return BOOKERLY_16_FONT_ID;
+        case EXTRA_LARGE:
+          return BOOKERLY_18_FONT_ID;
+      }
+    case NOTOSANS:
+      switch (fontSize) {
+        case SMALL:
+          return NOTOSANS_12_FONT_ID;
+        case MEDIUM:
+        default:
+          return NOTOSANS_14_FONT_ID;
+        case LARGE:
+          return NOTOSANS_16_FONT_ID;
+        case EXTRA_LARGE:
+          return NOTOSANS_18_FONT_ID;
+      }
+    case OPENDYSLEXIC:
+      switch (fontSize) {
+        case SMALL:
+          return OPENDYSLEXIC_8_FONT_ID;
+        case MEDIUM:
+        default:
+          return OPENDYSLEXIC_10_FONT_ID;
+        case LARGE:
+          return OPENDYSLEXIC_12_FONT_ID;
+        case EXTRA_LARGE:
+          return OPENDYSLEXIC_14_FONT_ID;
+      }
+  }
+}
