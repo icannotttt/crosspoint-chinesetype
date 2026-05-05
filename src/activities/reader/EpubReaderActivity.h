@@ -40,6 +40,8 @@ class EpubReaderActivity final : public ActivityWithSubactivity {
   bool pendingGoHome = false;           // Defer go home to avoid race condition with display task
   bool skipNextButtonCheck = false;     // Skip button processing for one frame after subactivity exit
   bool pendingMarginRelayout = false;   // Defer heavy section relayout until margin-setting is confirmed
+  bool bluetoothBootstrapDone = false;   // Run Bluetooth startup logic only once after first render
+  unsigned long lastAutoPageTurnMs = 0;
   const std::function<void()> onGoBack;
   const std::function<void()> onGoHome;
 

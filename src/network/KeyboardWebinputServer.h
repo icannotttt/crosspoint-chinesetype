@@ -79,11 +79,13 @@ class KeyboardWebInputServer {
   std::unique_ptr<DNSServer> dnsServer;
   bool running = false;
   bool apModeStarted = false;
+  bool staModeStarted = false;
   bool textReceived = false;
   std::string receivedText;
   std::string ipAddress;
   wifi_ps_type_t previousSleepMode = WIFI_PS_NONE;
 
+  bool tryConnectSavedNetwork();
   void setupRoutes();
   void handleRootPage();
   void handleTextSubmit();

@@ -20,9 +20,9 @@ void readAndValidate(FsFile& file, uint8_t& member, const uint8_t maxValue) {
 }
 
 namespace {
-constexpr uint8_t SETTINGS_FILE_VERSION = 6;
+constexpr uint8_t SETTINGS_FILE_VERSION = 8;
 // 注意：如果修改了字段数量，需要同步更新这个值
-constexpr uint8_t SETTINGS_COUNT = 46;  // customSleepUsePxc 写到序列末尾
+constexpr uint8_t SETTINGS_COUNT = 47;  // autoPageTurnTime 写到序列末尾（autoPageTurn 运行态，不持久化）
 constexpr char SETTINGS_FILE[] = "/.crosspoint/settings.bin";
 
 // Validate front button mapping to ensure each hardware button is unique.
@@ -134,6 +134,7 @@ bool CrossPointSettings::saveToFile() const {
   //把蓝牙写上
   serialization::writePod(outputFile, bluetoothEnabled );
   serialization::writePod(outputFile, customSleepUsePxc);
+  serialization::writePod(outputFile, autoPageTurnTime);
   // New fields added at end for backward compatibility
   outputFile.close();
 
@@ -149,7 +150,7 @@ bool CrossPointSettings::loadFromFile() {
 
   uint8_t version;
   serialization::readPod(inputFile, version);
-  if (version != 5 && version != SETTINGS_FILE_VERSION) {
+  if (version != 5 && version != 6 && version != 7 && version != SETTINGS_FILE_VERSION) {
     Serial.printf("[%lu] [CPS] Deserialization failed: Unknown version %u\n", millis(), version);
     inputFile.close();
     return false;
@@ -305,6 +306,20 @@ bool CrossPointSettings::loadFromFile() {
       if (++settingsRead >= fileSettingsCount) break;
     }
 
+    if (version == 7) {
+      // v7 persisted autoPageTurn. Read and discard to keep binary compatibility.
+      uint8_t persistedAutoPageTurn = 0;
+      readAndValidate(inputFile, persistedAutoPageTurn, 2);
+      if (++settingsRead >= fileSettingsCount) break;
+    }
+
+    serialization::readPod(inputFile, autoPageTurnTime);
+    if (autoPageTurnTime < CrossPointSettings::AUTO_PAGE_TURN_TIME_MIN ||
+        autoPageTurnTime > CrossPointSettings::AUTO_PAGE_TURN_TIME_MAX) {
+      autoPageTurnTime = CrossPointSettings::AUTO_PAGE_TURN_TIME_MIN;
+    }
+    if (++settingsRead >= fileSettingsCount) break;
+
     // New fields added at end for backward compatibility
   } while (false);
 
@@ -314,8 +329,11 @@ bool CrossPointSettings::loadFromFile() {
     applyLegacyFrontButtonLayout(*this);
   }
 
+  // Auto page turn is runtime-only. Always start disabled after boot/load.
+  autoPageTurn = 0;
+
   inputFile.close();
-  bluetoothEnabled = 0;//先默认蓝牙关闭
+  // bluetoothEnabled = 0;//先默认蓝牙关闭
   Serial.printf("[%lu] [CPS] Settings loaded from file\n", millis());
   return true;
 }

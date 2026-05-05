@@ -8,6 +8,8 @@
 
 namespace {
 constexpr char latestReleaseUrl[] = "https://gitee.com/api/v5/repos/allocated/crosspoint_chinesetype/releases/latest";
+// constexpr char latestReleaseUrl[] = "https://api.github.com/repos/icannotttt/crosspoint-chinesetype/releases/latest";
+
 
 /* This is buffer and size holder to keep upcoming data from latestReleaseUrl */
 char* local_buf;

@@ -78,8 +78,8 @@ std::unique_ptr<Txt> ReaderActivity::loadTxt(const std::string& path) {
 }
 
 void ReaderActivity::goToLibrary(const std::string& fromBookPath) {
-  // If coming from a book, start in that book's folder; otherwise start from root
-  const auto initialPath = fromBookPath.empty() ? "/" : extractFolderPath(fromBookPath);
+  // Pass full file path when available so library can restore exact file selection.
+  const auto initialPath = fromBookPath.empty() ? "/" : fromBookPath;
   onGoToLibrary(initialPath);
 }
 
@@ -111,7 +111,11 @@ void ReaderActivity::onGoToImgReader(ImgReaderActivity::ImageType imageType, con
   currentBookPath = imagePath;
   exitActivity();
   enterNewActivity(new ImgReaderActivity(renderer, mappedInput, imagePath, imageType,
-                                         [this, imagePath] { goToLibrary(imagePath); }, [this] { onGoBack(); }));
+                                         [this](const std::string& currentImagePath) {
+                                           currentBookPath = currentImagePath;
+                                           goToLibrary(currentImagePath);
+                                         },
+                                         [this] { onGoBack(); }));
 }
 
 void ReaderActivity::onEnter() {

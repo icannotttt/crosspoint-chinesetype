@@ -119,12 +119,12 @@ EInkDisplay::EInkDisplay(int8_t sclk, int8_t mosi, int8_t cs, int8_t dc, int8_t 
       frameBufferActive(nullptr),
 #endif
       customLutActive(false) {
-  if (Serial) Serial.printf("[%lu] EInkDisplay: Constructor called\n", millis());
-  if (Serial) Serial.printf("[%lu]   SCLK=%d, MOSI=%d, CS=%d, DC=%d, RST=%d, BUSY=%d\n", millis(), sclk, mosi, cs, dc, rst, busy);
+  Serial.printf("[%lu] EInkDisplay: Constructor called\n", millis());
+  Serial.printf("[%lu]   SCLK=%d, MOSI=%d, CS=%d, DC=%d, RST=%d, BUSY=%d\n", millis(), sclk, mosi, cs, dc, rst, busy);
 }
 
 void EInkDisplay::begin() {
-  if (Serial) Serial.printf("[%lu] EInkDisplay: begin() called\n", millis());
+  Serial.printf("[%lu] EInkDisplay: begin() called\n", millis());
 
   frameBuffer = frameBuffer0;
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
@@ -134,18 +134,18 @@ void EInkDisplay::begin() {
   // Initialize to white
   memset(frameBuffer0, 0xFF, BUFFER_SIZE);
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
-  if (Serial) Serial.printf("[%lu]   Static frame buffer (%lu bytes = 48KB)\n", millis(), BUFFER_SIZE);
+  Serial.printf("[%lu]   Static frame buffer (%lu bytes = 48KB)\n", millis(), BUFFER_SIZE);
 #else
   memset(frameBuffer1, 0xFF, BUFFER_SIZE);
-  if (Serial) Serial.printf("[%lu]   Static frame buffers (2 x %lu bytes = 96KB)\n", millis(), BUFFER_SIZE);
+  Serial.printf("[%lu]   Static frame buffers (2 x %lu bytes = 96KB)\n", millis(), BUFFER_SIZE);
 #endif
 
-  if (Serial) Serial.printf("[%lu]   Initializing e-ink display driver...\n", millis());
+  Serial.printf("[%lu]   Initializing e-ink display driver...\n", millis());
 
   // Initialize SPI with custom pins
   SPI.begin(_sclk, -1, _mosi, _cs);
   spiSettings = SPISettings(40000000, MSBFIRST, SPI_MODE0);  // MODE0 is standard for SSD1677
-  if (Serial) Serial.printf("[%lu]   SPI initialized at 40 MHz, Mode 0\n", millis());
+  Serial.printf("[%lu]   SPI initialized at 40 MHz, Mode 0\n", millis());
 
   // Setup GPIO pins
   pinMode(_cs, OUTPUT);
@@ -156,7 +156,7 @@ void EInkDisplay::begin() {
   digitalWrite(_cs, HIGH);
   digitalWrite(_dc, HIGH);
 
-  if (Serial) Serial.printf("[%lu]   GPIO pins configured\n", millis());
+  Serial.printf("[%lu]   GPIO pins configured\n", millis());
 
   // Reset display
   resetDisplay();
@@ -164,7 +164,7 @@ void EInkDisplay::begin() {
   // Initialize display controller
   initDisplayController();
 
-  if (Serial) Serial.printf("[%lu]   E-ink display driver initialized\n", millis());
+  Serial.printf("[%lu]   E-ink display driver initialized\n", millis());
 }
 
 // ============================================================================
@@ -172,14 +172,14 @@ void EInkDisplay::begin() {
 // ============================================================================
 
 void EInkDisplay::resetDisplay() {
-  if (Serial) Serial.printf("[%lu]   Resetting display...\n", millis());
+  Serial.printf("[%lu]   Resetting display...\n", millis());
   digitalWrite(_rst, HIGH);
   delay(20);
   digitalWrite(_rst, LOW);
   delay(2);
   digitalWrite(_rst, HIGH);
   delay(20);
-  if (Serial) Serial.printf("[%lu]   Display reset complete\n", millis());
+  Serial.printf("[%lu]   Display reset complete\n", millis());
 }
 
 void EInkDisplay::sendCommand(uint8_t command) {
@@ -214,17 +214,17 @@ void EInkDisplay::waitWhileBusy(const char* comment) {
   while (digitalRead(_busy) == HIGH) {
     delay(1);
     if (millis() - start > 10000) {
-      if (Serial) Serial.printf("[%lu]   Timeout waiting for busy%s\n", millis(), comment ? comment : "");
+      Serial.printf("[%lu]   Timeout waiting for busy%s\n", millis(), comment ? comment : "");
       break;
     }
   }
   if (comment) {
-    if (Serial) Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), comment, millis() - start);
+    Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), comment, millis() - start);
   }
 }
 
 void EInkDisplay::initDisplayController() {
-  if (Serial) Serial.printf("[%lu]   Initializing SSD1677 controller...\n", millis());
+  Serial.printf("[%lu]   Initializing SSD1677 controller...\n", millis());
 
   const uint8_t TEMP_SENSOR_INTERNAL = 0x80;
 
@@ -258,7 +258,7 @@ void EInkDisplay::initDisplayController() {
   // Set up full screen RAM area
   setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 
-  if (Serial) Serial.printf("[%lu]   Clearing RAM buffers...\n", millis());
+  Serial.printf("[%lu]   Clearing RAM buffers...\n", millis());
   sendCommand(CMD_AUTO_WRITE_BW_RAM);  // Auto write BW RAM
   sendData(0xF7);
   waitWhileBusy(" CMD_AUTO_WRITE_BW_RAM");
@@ -267,7 +267,7 @@ void EInkDisplay::initDisplayController() {
   sendData(0xF7);                       // Fill with white pattern
   waitWhileBusy(" CMD_AUTO_WRITE_RED_RAM");
 
-  if (Serial) Serial.printf("[%lu]   SSD1677 controller initialized\n", millis());
+  Serial.printf("[%lu]   SSD1677 controller initialized\n", millis());
 }
 
 void EInkDisplay::setRamArea(const uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
@@ -312,7 +312,7 @@ void EInkDisplay::clearScreen(const uint8_t color) const {
 void EInkDisplay::drawImage(const uint8_t* imageData, const uint16_t x, const uint16_t y, const uint16_t w, const uint16_t h,
                             const bool fromProgmem) const {
   if (!frameBuffer) {
-    if (Serial) Serial.printf("[%lu]   ERROR: Frame buffer not allocated!\n", millis());
+    Serial.printf("[%lu]   ERROR: Frame buffer not allocated!\n", millis());
     return;
   }
 
@@ -340,19 +340,50 @@ void EInkDisplay::drawImage(const uint8_t* imageData, const uint16_t x, const ui
     }
   }
 
-  if (Serial) Serial.printf("[%lu]   Image drawn to frame buffer\n", millis());
+  Serial.printf("[%lu]   Image drawn to frame buffer\n", millis());
 }
+void EInkDisplay::drawImageTransparent(const uint8_t* imageData, const uint16_t x, const uint16_t y, const uint16_t w, const uint16_t h,
+                                     const bool fromProgmem) const {
+  if (!frameBuffer) {
+    Serial.printf("[%lu]   ERROR: Frame buffer not allocated!\n", millis());
+    return;
+  }
+
+  // Calculate bytes per line for the image
+  const uint16_t imageWidthBytes = w / 8;
+
+  // Copy only black pixels to frame buffer
+  for (uint16_t row = 0; row < h; row++) {
+    const uint16_t destY = y + row;
+    if (destY >= DISPLAY_HEIGHT)
+      break;
+
+    const uint16_t destOffset = destY * DISPLAY_WIDTH_BYTES + (x / 8);
+    const uint16_t srcOffset = row * imageWidthBytes;
+
+    for (uint16_t col = 0; col < imageWidthBytes; col++) {
+      if ((x / 8 + col) >= DISPLAY_WIDTH_BYTES)
+        break;
+
+      uint8_t srcByte = fromProgmem ? pgm_read_byte(&imageData[srcOffset + col]) : imageData[srcOffset + col];
+      frameBuffer[destOffset + col] &= srcByte;
+    }
+  }
+
+  Serial.printf("[%lu]   Transparent image drawn to frame buffer\n", millis());
+}
+
 
 void EInkDisplay::writeRamBuffer(uint8_t ramBuffer, const uint8_t* data, uint32_t size) {
   const char* bufferName = (ramBuffer == CMD_WRITE_RAM_BW) ? "BW" : "RED";
   const unsigned long startTime = millis();
-  if (Serial) Serial.printf("[%lu]   Writing frame buffer to %s RAM (%lu bytes)...\n", startTime, bufferName, size);
+  Serial.printf("[%lu]   Writing frame buffer to %s RAM (%lu bytes)...\n", startTime, bufferName, size);
 
   sendCommand(ramBuffer);
   sendData(data, size);
 
   const unsigned long duration = millis() - startTime;
-  if (Serial) Serial.printf("[%lu]   %s RAM write complete (%lu ms)\n", millis(), bufferName, duration);
+  Serial.printf("[%lu]   %s RAM write complete (%lu ms)\n", millis(), bufferName, duration);
 }
 
 void EInkDisplay::setFramebuffer(const uint8_t* bwBuffer) const {
@@ -408,6 +439,16 @@ void EInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
 }
 #endif
 
+/*************  ✨ Windsurf Command ⭐  *************/
+/**
+ * @brief Display the current frame buffer content on the screen.
+ * @param mode Refresh mode (FAST_REFRESH, HALF_REFRESH, FULL_REFRESH)
+ * @details If the screen is off, the refresh mode is forced to HALF_REFRESH.
+ *        If the display is currently in grayscale mode, it is reverted to black/white mode first.
+ *        Set up the full screen RAM area before writing the frame buffer to the display.
+ *        If the refresh mode is not FAST_REFRESH, write the frame buffer to both BW and RED RAM.
+
+/*******  9004e1aa-e37f-4039-a766-e4e059d6a244  *******/
 void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
   if (!isScreenOn && !turnOffScreen)
   {
@@ -443,7 +484,7 @@ void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
 #endif
 
   // Refresh the display
-  refreshDisplay(mode, turnOffScreen);
+  refreshDisplay(mode);
 
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
   // In single buffer mode always sync RED RAM after refresh to prepare for next fast refresh
@@ -456,23 +497,23 @@ void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
 // EXPERIMENTAL: Windowed update support
 // Displays only a rectangular region of the frame buffer, preserving the rest of the screen.
 // Requirements: x and w must be byte-aligned (multiples of 8 pixels)
-void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const bool turnOffScreen) {
-  if (Serial) Serial.printf("[%lu]   Displaying window at (%d,%d) size (%dx%d)\n", millis(), x, y, w, h);
+void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  Serial.printf("[%lu]   Displaying window at (%d,%d) size (%dx%d)\n", millis(), x, y, w, h);
 
   // Validate bounds
   if (x + w > DISPLAY_WIDTH || y + h > DISPLAY_HEIGHT) {
-    if (Serial) Serial.printf("[%lu]   ERROR: Window bounds exceed display dimensions!\n", millis());
+    Serial.printf("[%lu]   ERROR: Window bounds exceed display dimensions!\n", millis());
     return;
   }
 
   // Validate byte alignment
   if (x % 8 != 0 || w % 8 != 0) {
-    if (Serial) Serial.printf("[%lu]   ERROR: Window x and width must be byte-aligned (multiples of 8)!\n", millis());
+    Serial.printf("[%lu]   ERROR: Window x and width must be byte-aligned (multiples of 8)!\n", millis());
     return;
   }
 
   if (!frameBuffer) {
-    if (Serial) Serial.printf("[%lu]   ERROR: Frame buffer not allocated!\n", millis());
+    Serial.printf("[%lu]   ERROR: Frame buffer not allocated!\n", millis());
     return;
   }
 
@@ -486,7 +527,7 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
   const uint16_t windowWidthBytes = w / 8;
   const uint32_t windowBufferSize = windowWidthBytes * h;
 
-  if (Serial) Serial.printf("[%lu]   Window buffer size: %lu bytes (%d x %d pixels)\n", millis(), windowBufferSize, w, h);
+  Serial.printf("[%lu]   Window buffer size: %lu bytes (%d x %d pixels)\n", millis(), windowBufferSize, w, h);
 
   // Allocate temporary buffer on stack
   std::vector<uint8_t> windowBuffer(windowBufferSize);
@@ -518,7 +559,7 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
 #endif
 
   // Perform fast refresh
-  refreshDisplay(FAST_REFRESH, turnOffScreen);
+  refreshDisplay(FAST_REFRESH);
 
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
   // Post-refresh: Sync RED RAM with current window (for next fast refresh)
@@ -526,7 +567,7 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
   writeRamBuffer(CMD_WRITE_RAM_RED, windowBuffer.data(), windowBufferSize);
 #endif
 
-  if (Serial) Serial.printf("[%lu]   Window display complete\n", millis());
+  Serial.printf("[%lu]   Window display complete\n", millis());
 }
 
 void EInkDisplay::displayGrayBuffer(const bool turnOffScreen) {
@@ -584,20 +625,20 @@ void EInkDisplay::refreshDisplay(const RefreshMode mode, const bool turnOffScree
 
   // Power on and refresh display
   const char* refreshType = (mode == FULL_REFRESH) ? "full" : (mode == HALF_REFRESH) ? "half" : "fast";
-  if (Serial) Serial.printf("[%lu]   Powering on display 0x%02X (%s refresh)...\n", millis(), displayMode, refreshType);
+  Serial.printf("[%lu]   Powering on display 0x%02X (%s refresh)...\n", millis(), displayMode, refreshType);
   sendCommand(CMD_DISPLAY_UPDATE_CTRL2);
   sendData(displayMode);
 
   sendCommand(CMD_MASTER_ACTIVATION);
 
   // Wait for display to finish updating
-  if (Serial) Serial.printf("[%lu]   Waiting for display refresh...\n", millis());
+  Serial.printf("[%lu]   Waiting for display refresh...\n", millis());
   waitWhileBusy(refreshType);
 }
 
 void EInkDisplay::setCustomLUT(const bool enabled, const unsigned char* lutData) {
   if (enabled) {
-    if (Serial) Serial.printf("[%lu]   Loading custom LUT...\n", millis());
+    Serial.printf("[%lu]   Loading custom LUT...\n", millis());
 
     // Load custom LUT (first 105 bytes: VS + TP/RP + frame rate)
     sendCommand(CMD_WRITE_LUT);
@@ -618,15 +659,15 @@ void EInkDisplay::setCustomLUT(const bool enabled, const unsigned char* lutData)
     sendData(pgm_read_byte(&lutData[109]));
 
     customLutActive = true;
-    if (Serial) Serial.printf("[%lu]   Custom LUT loaded\n", millis());
+    Serial.printf("[%lu]   Custom LUT loaded\n", millis());
   } else {
     customLutActive = false;
-    if (Serial) Serial.printf("[%lu]   Custom LUT disabled\n", millis());
+    Serial.printf("[%lu]   Custom LUT disabled\n", millis());
   }
 }
 
 void EInkDisplay::deepSleep() {
-  if (Serial) Serial.printf("[%lu]   Preparing display for deep sleep...\n", millis());
+  Serial.printf("[%lu]   Preparing display for deep sleep...\n", millis());
 
   // First, power down the display properly
   // This shuts down the analog power rails and clock
@@ -646,7 +687,7 @@ void EInkDisplay::deepSleep() {
   }
 
   // Now enter deep sleep mode
-  if (Serial) Serial.printf("[%lu]   Entering deep sleep mode...\n", millis());
+  Serial.printf("[%lu]   Entering deep sleep mode...\n", millis());
   sendCommand(CMD_DEEP_SLEEP);
   sendData(0x01);  // Enter deep sleep
 }
@@ -657,7 +698,7 @@ void EInkDisplay::saveFrameBufferAsPBM(const char* filename) {
 
   std::ofstream file(filename, std::ios::binary);
   if (!file) {
-    if (Serial) Serial.printf("Failed to open %s for writing\n", filename);
+    Serial.printf("Failed to open %s for writing\n", filename);
     return;
   }
 
@@ -693,9 +734,9 @@ void EInkDisplay::saveFrameBufferAsPBM(const char* filename) {
 
   file.write(reinterpret_cast<const char*>(rotatedBuffer.data()), rotatedBuffer.size());
   file.close();
-  if (Serial) Serial.printf("Saved framebuffer to %s\n", filename);
+  Serial.printf("Saved framebuffer to %s\n", filename);
 #else
   (void)filename;
-  if (Serial) Serial.println("saveFrameBufferAsPBM is not supported on Arduino builds.");
+  Serial.println("saveFrameBufferAsPBM is not supported on Arduino builds.");
 #endif
 }

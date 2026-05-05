@@ -35,6 +35,7 @@ class Txt {
   void splitChaptersByNewline(); 
   void saveChapterToTxt(int startChapter);
   bool loadChapterFromTxt(int startChapter);
+    std::string getChapterCacheFilePath(int startChapter) const;
   
   bool m_isVolumeOnlyBook = false;
 

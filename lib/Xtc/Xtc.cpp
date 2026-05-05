@@ -243,7 +243,7 @@ bool Xtc::generateCoverBmp() const {
     const uint8_t* plane1 = pageBuffer;
     const uint8_t* plane2 = pageBuffer + planeSize;
     const size_t colBytes = (pageInfo.height + 7) / 8;
-    const size_t srcRowSize = (pageInfo.width * 2 + 7) / 8;
+    AtkinsonDitherer dither(pageInfo.width);
 
     uint8_t* rowBuffer = static_cast<uint8_t*>(malloc(rowSize));
     if (!rowBuffer) {
@@ -257,7 +257,7 @@ bool Xtc::generateCoverBmp() const {
       memset(rowBuffer, 0x00, rowSize);
 
       if (y < normalRowEnd) {
-        // 前 height-20 行：正常渲染（已修复色反）
+        // 前 height-20 行：使用与 EPUB 一致的 Atkinson 2bit 抖点流程
         for (uint16_t x = 0; x < pageInfo.width; x++) {
           const size_t colIndex = pageInfo.width - 1 - x;
           const size_t byteInCol = y / 8;
@@ -265,14 +265,16 @@ bool Xtc::generateCoverBmp() const {
           const size_t byteOffset = colIndex * colBytes + byteInCol;
           const uint8_t bit1 = (plane1[byteOffset] >> bitInByte) & 1;
           const uint8_t bit2 = (plane2[byteOffset] >> bitInByte) & 1;
-          uint8_t pixelValue = (bit1 << 1) | bit2;
-          pixelValue = 3 - pixelValue; // 色反修复
+          const uint8_t sourceValue = (bit1 << 1) | bit2;
+          const int gray = sourceValue * 85;
+          const uint8_t pixelValue = dither.processPixel(adjustPixel(gray), x);
 
           const size_t bytePos = x / 4;
           const size_t bitPos = 6 - ((x % 4) * 2);
           rowBuffer[bytePos] &= ~(0b11 << bitPos);
           rowBuffer[bytePos] |= (pixelValue << bitPos);
         }
+        dither.nextRow();
       } else {
         // 最后20行：强制填充白色（2bit白色值=3）
         for (uint16_t x = 0; x < pageInfo.width; x++) {
@@ -407,36 +409,60 @@ bool Xtc::scaleCoverToThumb(int height) const {
     return false;
   }
 
-  // 逐行缩放
+  // 逐行缩放 + Atkinson 1bit 抖点（对齐 EPUB 缩略图风格）
   coverFile.open(coverPath.c_str(), FILE_READ);
-  coverFile.seek(dataOff);
   float scaleInv = 1.0f / scale;
+  Atkinson1BitDitherer atkinsonDither(outW);
+
   for (int y = 0; y < outH; y++) {
     memset(thumbBuf, 0xFF, rowSize);
-    int sy = static_cast<int>(y * scaleInv);
-    sy = (sy >= coverH) ? (coverH-1) : sy;
+    int syStart = static_cast<int>(y * scaleInv);
+    int syEnd = static_cast<int>((y + 1) * scaleInv);
+    syStart = (syStart >= coverH) ? (coverH - 1) : syStart;
+    syEnd = (syEnd > coverH) ? coverH : syEnd;
+    if (syEnd <= syStart) syEnd = syStart + 1;
 
-    // 读取cover的当前行
-    coverFile.seek(dataOff + sy * coverRowSz);
-    coverFile.read(coverBuf, coverRowSz);
-
-    // 逐像素缩放
+    // 面积平均后再抖点，避免最近邻导致的锯齿和脏点
     for (int x = 0; x < outW; x++) {
-      int sx = static_cast<int>(x * scaleInv);
-      sx = (sx >= coverW) ? (coverW-1) : sx;
+      int sxStart = static_cast<int>(x * scaleInv);
+      int sxEnd = static_cast<int>((x + 1) * scaleInv);
+      sxStart = (sxStart >= coverW) ? (coverW - 1) : sxStart;
+      sxEnd = (sxEnd > coverW) ? coverW : sxEnd;
+      if (sxEnd <= sxStart) sxEnd = sxStart + 1;
 
-      uint8_t pix = 1;
-      if (coverBpp == 1) {
-        pix = (coverBuf[sx >> 3] >> (7 - (sx & 7))) & 1;
-      } else if (coverBpp == 2) {
-        pix = (coverBuf[sx >> 2] >> (6 - ((sx & 3) << 1))) & 3;
-        pix = (pix >= 2) ? 1 : 0;
+      uint32_t graySum = 0;
+      uint32_t totalCount = 0;
+
+      for (int sy = syStart; sy < syEnd; sy++) {
+        coverFile.seek(dataOff + sy * coverRowSz);
+        if (coverFile.read(coverBuf, coverRowSz) != static_cast<int>(coverRowSz)) {
+          continue;
+        }
+
+        for (int sx = sxStart; sx < sxEnd; sx++) {
+          uint8_t gray = 255;
+          if (coverBpp == 1) {
+            const uint8_t pix = (coverBuf[sx >> 3] >> (7 - (sx & 7))) & 1;
+            gray = pix ? 0 : 255;
+          } else if (coverBpp == 2) {
+            const uint8_t pix = (coverBuf[sx >> 2] >> (6 - ((sx & 3) << 1))) & 3;
+            gray = (3 - pix) * 85;
+          }
+
+          graySum += gray;
+          totalCount++;
+        }
       }
 
-      if (!pix) {
+      const uint8_t avgGray = (totalCount > 0) ? static_cast<uint8_t>(graySum / totalCount) : 255;
+      const uint8_t oneBit = atkinsonDither.processPixel(avgGray, x);
+
+      if (!oneBit) {
         thumbBuf[x >> 3] &= ~(1 << (7 - (x & 7)));
       }
     }
+
+    atkinsonDither.nextRow();
     thumbFile.write(thumbBuf, rowSize);
   }
 
@@ -446,7 +472,7 @@ bool Xtc::scaleCoverToThumb(int height) const {
   coverFile.close();
   thumbFile.close();
 
-  Serial.printf("[%lu] [XTC] 从cover.bmp缩放到thumb: %dx%d -> %dx%d\n", millis(), coverW, coverH, outW, outH);
+  Serial.printf("[%lu] [XTC] 从cover.bmp缩放到thumb(Atkinson): %dx%d -> %dx%d\n", millis(), coverW, coverH, outW, outH);
   return true;
 }
 

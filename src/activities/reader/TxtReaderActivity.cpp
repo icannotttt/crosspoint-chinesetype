@@ -3,6 +3,7 @@
 #include <GfxRenderer.h>
 #include <SDCardManager.h>
 #include <Serialization.h>
+#include <BluetoothHIDManager.h>
 #include <Utf8.h>
 
 #include "CrossPointSettings.h"
@@ -12,10 +13,16 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
+#include "BookmarkActivity.h"
+#include "ReaderEntryModeSelectionActivity.h"
+#include "TxtBookmarkSelectionActivity.h"
 #include "TxtReaderChapterSelectionActivity.h"
+#include "../settings/BluetoothSettingsActivity.h"
+#include "../../util/ReaderBluetoothBootstrap.h"
 
 namespace {
 constexpr unsigned long goHomeMs = 1000;
+constexpr unsigned long bookmarkPressMs = 700;
 constexpr int statusBarMargin = 20;
 constexpr int progressBarMarginTop = 1;
 constexpr size_t CHUNK_SIZE = 8 * 1024;  // 8KB chunk for reading
@@ -23,6 +30,268 @@ constexpr size_t CHUNK_SIZE = 8 * 1024;  // 8KB chunk for reading
 // Cache file magic and version
 constexpr uint32_t CACHE_MAGIC = 0x54585449;  // "TXTI"
 constexpr uint8_t CACHE_VERSION = 3;          // Increment when cache format changes
+constexpr uint32_t WALLPAPER_PXC_MAGIC = 0x31584350;   // "PXC1"
+constexpr uint16_t WALLPAPER_PXC_VERSION = 1;
+constexpr char WALLPAPER_PXC_PATH[] = "/.crosspoint/wallpaper_bg.pxc";
+constexpr uint8_t WALLPAPER_PXC_FIXED_ORIENTATION = CrossPointSettings::ORIENTATION::PORTRAIT;
+bool loadWallpaperPxcToFramebuffer(const std::string& pxcPath, GfxRenderer& renderer) {
+  FsFile input;
+  if (!SdMan.openFileForRead("SLP", pxcPath, input)) {
+    return false;
+  }
+
+  uint32_t magic = 0;
+  uint16_t version = 0;
+  uint8_t cachedOrientation = 0;
+  uint8_t reserved = 0;
+  uint32_t payloadSize = 0;
+
+  serialization::readPod(input, magic);
+  serialization::readPod(input, version);
+  serialization::readPod(input, cachedOrientation);
+  serialization::readPod(input, reserved);
+  serialization::readPod(input, payloadSize);
+
+  const uint32_t expectedPayload = static_cast<uint32_t>(renderer.getBufferSize());
+    if (magic != WALLPAPER_PXC_MAGIC || version != WALLPAPER_PXC_VERSION ||
+      cachedOrientation != WALLPAPER_PXC_FIXED_ORIENTATION ||
+      payloadSize != expectedPayload) {
+    input.close();
+    return false;
+  }
+
+  uint8_t* frameBuffer = renderer.getFrameBuffer();
+  if (!frameBuffer) {
+    input.close();
+    return false;
+  }
+
+  size_t totalRead = 0;
+  while (totalRead < payloadSize) {
+    const size_t toRead = std::min(static_cast<size_t>(1024), static_cast<size_t>(payloadSize - totalRead));
+    const int bytesRead = input.read(frameBuffer + totalRead, toRead);
+    if (bytesRead <= 0) {
+      input.close();
+      return false;
+    }
+    totalRead += static_cast<size_t>(bytesRead);
+  }
+
+  input.close();
+  return true;
+}
+
+
+
+
+bool saveWallpaperPxcFromFramebuffer(const std::string& pxcPath, GfxRenderer& renderer) {
+  uint8_t* frameBuffer = renderer.getFrameBuffer();
+  if (!frameBuffer) {
+    return false;
+  }
+
+  SdMan.mkdir("/.crosspoint");
+
+  FsFile output;
+  if (!SdMan.openFileForWrite("SLP", pxcPath, output)) {
+    return false;
+  }
+
+  const uint32_t payloadSize = static_cast<uint32_t>(renderer.getBufferSize());
+  const uint8_t reserved = 0;
+
+  serialization::writePod(output, WALLPAPER_PXC_MAGIC);
+  serialization::writePod(output, WALLPAPER_PXC_VERSION);
+  serialization::writePod(output, WALLPAPER_PXC_FIXED_ORIENTATION);
+  serialization::writePod(output, reserved);
+  serialization::writePod(output, payloadSize);
+
+  size_t totalWritten = 0;
+  while (totalWritten < payloadSize) {
+    const size_t toWrite = std::min(static_cast<size_t>(1024), static_cast<size_t>(payloadSize - totalWritten));
+    const size_t bytesWritten = output.write(frameBuffer + totalWritten, toWrite);
+    if (bytesWritten != toWrite) {
+      output.close();
+      return false;
+    }
+    totalWritten += bytesWritten;
+  }
+
+  output.sync();
+  output.close();
+  return true;
+}
+
+
+
+int clampPercent(int percent) {
+  if (percent < 0) {
+    return 0;
+  }
+  if (percent > 100) {
+    return 100;
+  }
+  return percent;
+}
+
+uint8_t clampAutoPageTurnSeconds(const uint8_t seconds) {
+  if (seconds < CrossPointSettings::AUTO_PAGE_TURN_TIME_MIN) {
+    return CrossPointSettings::AUTO_PAGE_TURN_TIME_MIN;
+  }
+  if (seconds > CrossPointSettings::AUTO_PAGE_TURN_TIME_MAX) {
+    return CrossPointSettings::AUTO_PAGE_TURN_TIME_MAX;
+  }
+  return seconds;
+}
+
+bool shouldTriggerAutoPageTurn(unsigned long& lastTriggerMs) {
+  const unsigned long now = millis();
+  if (!SETTINGS.autoPageTurn) {
+    lastTriggerMs = now;
+    return false;
+  }
+  const uint8_t seconds = clampAutoPageTurnSeconds(SETTINGS.autoPageTurnTime);
+  if (now - lastTriggerMs >= static_cast<unsigned long>(seconds) * 1000UL) {
+    lastTriggerMs = now;
+    return true;
+  }
+  return false;
+}
+
+void drawDashedLine(GfxRenderer& renderer, int x1, int y, int x2, const bool isDark) {
+  const int startX = std::min(x1, x2);
+  const int endX = std::max(x1, x2);
+  int currentX = startX;
+
+  const int dashLen = 20;
+  const int gapLen = 10;
+
+  while (currentX < endX) {
+    const int segmentEndX = std::min(currentX + dashLen, endX);
+    renderer.drawLine(currentX, y, segmentEndX, y, isDark);
+    currentX = segmentEndX + gapLen;
+  }
+}
+
+uint32_t utf8NextCodepointAt(const std::string& s, size_t& pos) {
+  if (pos >= s.size()) {
+    return 0;
+  }
+
+  const unsigned char c = static_cast<unsigned char>(s[pos]);
+  uint32_t cp = 0;
+  size_t len = 0;
+
+  if (c < 0x80) {
+    cp = c;
+    len = 1;
+  } else if (c < 0xE0 && pos + 1 < s.size()) {
+    cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(s[pos + 1]) & 0x3F);
+    len = 2;
+  } else if (c < 0xF0 && pos + 2 < s.size()) {
+    cp = ((c & 0x0F) << 12) | ((static_cast<unsigned char>(s[pos + 1]) & 0x3F) << 6) |
+         (static_cast<unsigned char>(s[pos + 2]) & 0x3F);
+    len = 3;
+  } else if (pos + 3 < s.size()) {
+    cp = ((c & 0x07) << 18) | ((static_cast<unsigned char>(s[pos + 1]) & 0x3F) << 12) |
+         ((static_cast<unsigned char>(s[pos + 2]) & 0x3F) << 6) |
+         (static_cast<unsigned char>(s[pos + 3]) & 0x3F);
+    len = 4;
+  } else {
+    cp = c;
+    len = 1;
+  }
+
+  pos += len;
+  return cp;
+}
+
+bool isCjkLeadingPunctuation(const std::string& unit) {
+  size_t pos = 0;
+  const uint32_t cp = utf8NextCodepointAt(unit, pos);
+  const uint32_t leadingPuncts[] = {
+      0x3002,  // 。
+      0xFF0C,  // ，
+      0xFF01,  // ！
+      0xFF1F,  // ？
+      0xFF1B,  // ；
+      0xFF1A,  // ：
+      0x3001,  // 、
+      0xFF09,  // ）
+      0x301B,  // 】
+      0x300B,  // 》
+      0x201D,  // ”
+      0x2019,  // ’
+  };
+
+  for (const auto p : leadingPuncts) {
+    if (cp == p) {
+      return true;
+    }
+  }
+  return false;
+}
+
+size_t utf8CharLenAt(const std::string& s, const size_t pos) {
+  if (pos >= s.size()) {
+    return 0;
+  }
+  const unsigned char c = static_cast<unsigned char>(s[pos]);
+  if (c < 0x80) {
+    return 1;
+  }
+  if (c < 0xE0) {
+    return (pos + 1 < s.size()) ? 2 : 1;
+  }
+  if (c < 0xF0) {
+    return (pos + 2 < s.size()) ? 3 : 1;
+  }
+  return (pos + 3 < s.size()) ? 4 : 1;
+}
+
+size_t prevUtf8Boundary(const std::string& s, size_t idx) {
+  if (idx == 0) {
+    return 0;
+  }
+  if (idx > s.size()) {
+    idx = s.size();
+  }
+  idx--;
+  while (idx > 0 && (static_cast<unsigned char>(s[idx]) & 0xC0) == 0x80) {
+    idx--;
+  }
+  return idx;
+}
+
+size_t leadingTrimBytesForIndent(const std::string& s) {
+  size_t pos = 0;
+  while (pos < s.size()) {
+    const unsigned char c = static_cast<unsigned char>(s[pos]);
+    if (c == ' ' || c == '\t') {
+      pos += 1;
+      continue;
+    }
+    // U+00A0 NO-BREAK SPACE
+    if (pos + 1 < s.size() && c == 0xC2 && static_cast<unsigned char>(s[pos + 1]) == 0xA0) {
+      pos += 2;
+      continue;
+    }
+    // U+2003 EM SPACE
+    if (pos + 2 < s.size() && c == 0xE2 && static_cast<unsigned char>(s[pos + 1]) == 0x80 &&
+        static_cast<unsigned char>(s[pos + 2]) == 0x83) {
+      pos += 3;
+      continue;
+    }
+    // U+3000 IDEOGRAPHIC SPACE
+    if (pos + 2 < s.size() && c == 0xE3 && static_cast<unsigned char>(s[pos + 1]) == 0x80 &&
+        static_cast<unsigned char>(s[pos + 2]) == 0x80) {
+      pos += 3;
+      continue;
+    }
+    break;
+  }
+  return pos;
+}
 
 }  // namespace
 
@@ -38,6 +307,8 @@ void TxtReaderActivity::onEnter() {
   if (!txt) {
     return;
   }
+
+  shuttingDown = false;
 
   // Configure screen orientation based on settings
   switch (SETTINGS.orientation) {
@@ -71,6 +342,7 @@ void TxtReaderActivity::onEnter() {
 
   // Trigger first update
   updateRequired = true;
+  lastAutoPageTurnMs = millis();
 
   xTaskCreate(&TxtReaderActivity::taskTrampoline, "TxtReaderActivityTask",
               4096,               // Stack size
@@ -81,20 +353,36 @@ void TxtReaderActivity::onEnter() {
 }
 
 void TxtReaderActivity::onExit() {
+  shuttingDown = true;
+  updateRequired = false;
+
+  // Turn off auto page turning first to avoid triggering render updates during teardown.
+  SETTINGS.autoPageTurn = 0;
+
   ActivityWithSubactivity::onExit();
+
+  // Force-release BLE resources when leaving reader to maximize memory for parsing/rendering.
+  auto& btMgr = BluetoothHIDManager::getInstance();
+  if (btMgr.isEnabled()) {
+    btMgr.disable();
+  }
     // Save progress
   saveProgress();
 
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
 
-  // Wait until not rendering to delete task
-  xSemaphoreTake(renderingMutex, portMAX_DELAY);
   if (displayTaskHandle) {
-    vTaskDelete(displayTaskHandle);
-    displayTaskHandle = nullptr;
+    if (xSemaphoreTake(renderingMutex, portMAX_DELAY) == pdTRUE) {
+      vTaskDelete(displayTaskHandle);
+      displayTaskHandle = nullptr;
+      xSemaphoreGive(renderingMutex);
+    }
   }
-  vSemaphoreDelete(renderingMutex);
+
+  if (renderingMutex) {
+    vSemaphoreDelete(renderingMutex);
+  }
   renderingMutex = nullptr;
   pageOffsets.clear();
   currentPageLines.clear();
@@ -105,33 +393,99 @@ void TxtReaderActivity::onExit() {
 
 void TxtReaderActivity::loop() {
   if (subActivity) {
+    lastAutoPageTurnMs = millis();
     subActivity->loop();
     return;
   }
-  // 进入章节目录
+
+  if (skipNextButtonCheck) {
+    lastAutoPageTurnMs = millis();
+    const bool confirmCleared = !mappedInput.isPressed(MappedInputManager::Button::Confirm) &&
+                                !mappedInput.wasReleased(MappedInputManager::Button::Confirm);
+    const bool backCleared = !mappedInput.isPressed(MappedInputManager::Button::Back) &&
+                             !mappedInput.wasReleased(MappedInputManager::Button::Back);
+    if (confirmCleared && backCleared) {
+      skipNextButtonCheck = false;
+    }
+    return;
+  }
+  // 短按确认后选择进入目录或书签
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    {
-      xSemaphoreTake(renderingMutex, portMAX_DELAY);
+    if (mappedInput.getHeldTime() >= bookmarkPressMs) {
+      const int percent = totalPages > 0
+                              ? clampPercent(static_cast<int>(((currentPage + 1) * 100.0f) / totalPages + 0.5f))
+                              : 0;
+      if (xSemaphoreTake(renderingMutex, portMAX_DELAY) == pdTRUE) {
         exitActivity();
-        enterNewActivity(new TxtReaderChapterSelectionActivity(
-            this->renderer, this->mappedInput, txt, chapternum,
-            [this] {
+        enterNewActivity(new BookmarkActivity(
+            renderer, mappedInput, txt->getPath(), txt->getCachePath(), percent, currentPage, totalPages, chapternum,
+            [this](bool) {
               exitActivity();
               updateRequired = true;
-            },
-            [this](const int newChapterNum) {
-              chapternum = newChapterNum;       // 更新章节号
-              chapter_initialized = false;  // 重置初始化标记
-              pageOffsets.clear();          // 清空上一章节页码
-              totalPages = 0;               // 重置总页数
-              // 强制设置为0页（关键：覆盖后续loadProgress可能带来的干扰）
-              currentPage = 0;
-              updateRequired = true;
-              exitActivity();
-              updateRequired = true;
+            }));
+        xSemaphoreGive(renderingMutex);
+      }
+      return;
+    }
+
+    if (xSemaphoreTake(renderingMutex, portMAX_DELAY) == pdTRUE) {
+      exitActivity();
+      enterNewActivity(new ReaderEntryModeSelectionActivity(
+          this->renderer, this->mappedInput,
+          [this]() {
+            exitActivity();
+            skipNextButtonCheck = true;
+            updateRequired = true;
+          },
+          [this](ReaderEntryModeSelectionActivity::Mode mode) {
+            exitActivity();
+            if (mode == ReaderEntryModeSelectionActivity::Mode::CHAPTER) {
+              enterNewActivity(new TxtReaderChapterSelectionActivity(
+                  this->renderer, this->mappedInput, txt, chapternum,
+                  [this] {
+                    exitActivity();
+                    updateRequired = true;
+                  },
+                  [this](const int newChapterNum) {
+                    chapternum = newChapterNum;
+                    chapter_initialized = false;
+                    pageOffsets.clear();
+                    totalPages = 0;
+                    currentPage = 0;
+                    updateRequired = true;
+                    exitActivity();
+                    updateRequired = true;
+                  }));
+            } else if (mode == ReaderEntryModeSelectionActivity::Mode::BOOKMARK) {
+              enterNewActivity(new TxtBookmarkSelectionActivity(
+                  this->renderer, this->mappedInput, txt,
+                  [this]() {
+                    exitActivity();
+                    updateRequired = true;
+                  },
+                  [this](int newChapterNum, int newPage, int percent) {
+                    chapternum = newChapterNum;
+                    chapter_initialized = false;
+                    pageOffsets.clear();
+                    totalPages = 0;
+                    currentPage = std::max(0, newPage);
+                    pendingBookmarkPercent = clampPercent(percent);
+                    exitActivity();
+                    updateRequired = true;
+                  }));
+            } else if (mode == ReaderEntryModeSelectionActivity::Mode::BLUETOOTH) {
+              enterNewActivity(new BluetoothSettingsActivity(
+                  this->renderer, this->mappedInput,
+                  [this] {
+                    exitActivity();
+                    skipNextButtonCheck = true;
+                    updateRequired = true;
+                  }));
+            }
           }));
       xSemaphoreGive(renderingMutex);
     }
+    return;
   }
   // Long press BACK (1s+) goes directly to home
   if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= goHomeMs) {
@@ -153,17 +507,19 @@ void TxtReaderActivity::loop() {
                                                     mappedInput.wasReleased(MappedInputManager::Button::Left));
   const bool powerPageTurn = SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PAGE_TURN &&
                              mappedInput.wasReleased(MappedInputManager::Button::Power);
+    const bool autoTurnTriggered = shouldTriggerAutoPageTurn(lastAutoPageTurnMs);
   const bool nextTriggered = usePressForPageTurn
                                  ? (mappedInput.wasPressed(MappedInputManager::Button::PageForward) || powerPageTurn ||
-                                    mappedInput.wasPressed(MappedInputManager::Button::Right))
+                          mappedInput.wasPressed(MappedInputManager::Button::Right) || autoTurnTriggered)
                                  : (mappedInput.wasReleased(MappedInputManager::Button::PageForward) || powerPageTurn ||
-                                    mappedInput.wasReleased(MappedInputManager::Button::Right));
+                          mappedInput.wasReleased(MappedInputManager::Button::Right) || autoTurnTriggered);
 
   if (!prevTriggered && !nextTriggered) {
     return;
   }
 
   if (prevTriggered) {
+    lastAutoPageTurnMs = millis();
     if (currentPage > 0) {
       currentPage--;
       updateRequired = true;
@@ -181,6 +537,9 @@ void TxtReaderActivity::loop() {
       Serial.printf("[%lu] [TRS] Switch to chapter %d (prev), start from page 0\n", millis(), chapternum);
     }
   } else if (nextTriggered) {
+    if (!autoTurnTriggered) {
+      lastAutoPageTurnMs = millis();
+    }
     if (currentPage < totalPages - 1) {
       currentPage++;
       updateRequired = true;
@@ -204,14 +563,19 @@ void TxtReaderActivity::loop() {
 
 void TxtReaderActivity::displayTaskLoop() {
   while (true) {
+    if (shuttingDown) {
+      vTaskDelete(nullptr);
+    }
+
     if (updateRequired) {
       updateRequired = false;
       APP_STATE.isRenderComplete = false; // 标记渲染开始
-      xSemaphoreTake(renderingMutex, portMAX_DELAY);
-      renderScreen();
-      APP_STATE.isRenderComplete = true;  // 标记渲染完成（包括 saveProgress）
-      APP_STATE.saveToFile();
-      xSemaphoreGive(renderingMutex);
+      if (xSemaphoreTake(renderingMutex, portMAX_DELAY) == pdTRUE) {
+        renderScreen();
+        APP_STATE.isRenderComplete = true;  // 标记渲染完成（包括 saveProgress）
+        APP_STATE.saveToFile();
+        xSemaphoreGive(renderingMutex);
+      }
     }
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
@@ -222,6 +586,8 @@ void TxtReaderActivity::chapter_initializeReader(int chapter_num) {
   if (chapter_initialized) {
     return;
   }
+
+  const unsigned long initStartMs = millis();
 
   // 校验章节索引合法性
   if (chapter_num < 0 ) {
@@ -265,15 +631,27 @@ void TxtReaderActivity::chapter_initializeReader(int chapter_num) {
   Serial.printf("[%lu] [TRS] Viewport: %dx%d, lines per page: %d (chapter %d)\n", millis(), viewportWidth, viewportHeight,
                 linesPerPage, chapter_num);
 
-  if (!chapter_loadPageIndexCache(chapter_num)) {
+  const unsigned long cacheCheckStartMs = millis();
+  const bool pageCacheHit = chapter_loadPageIndexCache(chapter_num);
+  const unsigned long cacheCheckCostMs = millis() - cacheCheckStartMs;
+  Serial.printf("[%lu] [TRS-TIME] chapter=%d cache_check=%lums hit=%d\n", millis(), chapter_num,
+                cacheCheckCostMs, pageCacheHit ? 1 : 0);
+
+  if (!pageCacheHit) {
     // Cache not found, build page index for current chapter
-    const int page=chapter_num/25+1;
+    constexpr int CHAPTER_BATCH_SIZE = 15;
+    const int page = chapter_num / CHAPTER_BATCH_SIZE + 1;
     static int parsedPage = -1;
-    const int pagebegin=(page-1)*25;
-    // 相隔24章加载一次
+    const int pagebegin = (page - 1) * CHAPTER_BATCH_SIZE;
+    // 每个章节批次加载一次
+    unsigned long chapterParseCostMs = 0;
     if (parsedPage != page) {
+      const unsigned long chapterParseStartMs = millis();
       txt->parseChapterIndexAndOffset(pagebegin);
+      chapterParseCostMs = millis() - chapterParseStartMs;
       parsedPage = page;
+      Serial.printf("[%lu] [TRS-TIME] chapter=%d parseChapterIndexAndOffset=%lums batchStart=%d\n", millis(),
+                    chapter_num, chapterParseCostMs, pagebegin);
     }
     Serial.printf("[%lu] [TRS] load txtchapter: %d \n", millis(), chapter_num);
     //当前章节的范围
@@ -299,19 +677,30 @@ void TxtReaderActivity::chapter_initializeReader(int chapter_num) {
                   millis());
     return;
    }
+    const unsigned long buildIndexStartMs = millis();
     buildPageIndex(chapterOffsetbegin, chapterOffsetend - 1);
+    const unsigned long buildIndexCostMs = millis() - buildIndexStartMs;
+    Serial.printf("[%lu] [TRS-TIME] chapter=%d buildPageIndex=%lums pages=%d range=%zu\n", millis(), chapter_num,
+                  buildIndexCostMs, totalPages, (chapterOffsetend > chapterOffsetbegin) ? (chapterOffsetend - chapterOffsetbegin) : 0);
+
     //保存为章节缓存
+    const unsigned long saveCacheStartMs = millis();
     chapter_savePageIndexCache(chapter_num);
+    const unsigned long saveCacheCostMs = millis() - saveCacheStartMs;
+    Serial.printf("[%lu] [TRS-TIME] chapter=%d savePageIndexCache=%lums\n", millis(), chapter_num, saveCacheCostMs);
   }
 
   // 修改为章节进度
   //loadProgress();
 
   chapter_initialized = true;
+  Serial.printf("[%lu] [TRS-TIME] chapter=%d initialize_total=%lums\n", millis(), chapter_num,
+                millis() - initStartMs);
 }
 
 void TxtReaderActivity::buildPageIndex(size_t beginByte, size_t endByte) {
   pageOffsets.clear();
+  const unsigned long buildStartMs = millis();
   
   // 1. 参数合法性校验，避免越界
   const size_t fileSize = txt->getFileSize();
@@ -364,12 +753,17 @@ void TxtReaderActivity::buildPageIndex(size_t beginByte, size_t endByte) {
   totalPages = pageOffsets.size();
   Serial.printf("[%lu] [TRS] Built page index: %d pages (range %zu-%zu bytes)\n", 
                 millis(), totalPages, beginByte, endByte);
+  Serial.printf("[%lu] [TRS-TIME] buildPageIndex_loop=%lums pages=%d\n", millis(), millis() - buildStartMs, totalPages);
 }
 
 
 
-bool TxtReaderActivity::loadPageAtOffset(size_t offset,size_t endOffset, std::vector<std::string>& outLines, size_t& nextOffset) {
+bool TxtReaderActivity::loadPageAtOffset(size_t offset, size_t endOffset, std::vector<std::string>& outLines,
+                                         size_t& nextOffset, std::vector<int>* outIndentOffsets) {
   outLines.clear();
+  if (outIndentOffsets) {
+    outIndentOffsets->clear();
+  }
   const size_t fileSize = txt->getFileSize();
   const size_t virtualFileEnd = std::min(endOffset, fileSize);
 
@@ -395,10 +789,16 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset,size_t endOffset, std::ve
   size_t pos = 0;
 
   // 首行缩进控制变量
-  const std::string indentStr = "\xe2\x80\x83\xe2\x80\x83"; // 两个全角空格
-  //const std::string indentStr ="\u200B\u200B"; // 两个普通空格（测试用，实际使用全角空格）
   const int indentWidth = renderer.getTextWidth(cachedFontId, "中")*2; // 缩进宽度
+  const bool enableFirstLineIndent = SETTINGS.firstlineintented;
   bool isFirstLineOfPage = true; // 每页第一行不缩进
+
+  auto appendOutputLine = [&](const std::string& text, const int indentOffsetPx) {
+    outLines.push_back(text);
+    if (outIndentOffsets) {
+      outIndentOffsets->push_back(indentOffsetPx);
+    }
+  };
 
   while (pos < chunkSize && static_cast<int>(outLines.size()) < linesPerPage) {
     // Find end of line
@@ -432,28 +832,29 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset,size_t endOffset, std::ve
       continue;
     }
 
-    // 检测行首是否已有两个全角空格（仅对原生行检测）
-    bool hasLeadingIndent = false;
-    if (line.length() >= 6) {
-      std::string leadingChars = line.substr(0, 6);
-      if (leadingChars == indentStr) {
-        hasLeadingIndent = true; // 行首已有两个全角空格
-        needIndent = false;      // 重置缩进标记，避免重复缩进
-      }
+    // 段首空格清洗：无论是否启用首行缩进，都去掉源文本前导空白。
+    size_t leadingTrimBytes = leadingTrimBytesForIndent(line);
+    if (leadingTrimBytes > 0) {
+      line.erase(0, leadingTrimBytes);
+    }
+    if (line.empty()) {
+      pos = lineEnd + 1;
+      needIndent = true;
+      continue;
     }
 
     // 当前源行的首个渲染片段才允许缩进
     bool isFirstWrappedLineOfSource = true;
 
     // Track position within this source line (in bytes from pos)
-    size_t lineBytePos = 0;
+    size_t lineBytePos = leadingTrimBytes;
 
     // Word wrap if needed
     while (!line.empty() && static_cast<int>(outLines.size()) < linesPerPage) {
       // 计算行宽：仅原生行需要考虑缩进宽度，拆行完全不考虑
       int lineWidth = renderer.getTextWidth(cachedFontId, line.c_str());
       // 缩进判断：仅原生行 + 需要缩进 + 不是页首 + 无已有空格
-      const bool doIndent = isFirstWrappedLineOfSource && needIndent && !isFirstLineOfPage && !hasLeadingIndent;
+      const bool doIndent = enableFirstLineIndent && isFirstWrappedLineOfSource && needIndent && !isFirstLineOfPage;
       //测试
       //const bool doIndent = true;
       
@@ -471,10 +872,10 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset,size_t endOffset, std::ve
       if (lineWidth <= viewportWidth) {
         // 仅原生行添加缩进，拆行完全不添加
         if (doIndent) {
-          outLines.push_back(indentStr + line);
+          appendOutputLine(line, indentWidth);
           needIndent = false; // 原生行缩进后，该段落后续行（包括拆行）都不缩进
         } else {
-          outLines.push_back(line);
+          appendOutputLine(line, 0);
         }
         isFirstWrappedLineOfSource = false;
         lineBytePos = displayLen;  // Consumed entire display content
@@ -483,31 +884,101 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset,size_t endOffset, std::ve
         break;
       }
 
-      // Find break point（拆行逻辑）
-      size_t breakPos = line.length();
-      // 拆行宽度：完全不考虑缩进（拆行不缩进）
-      int allowedWidth = viewportWidth - (cachedParagraphAlignment == CrossPointSettings::LEFT_ALIGN ? wordSpacing : 0);
-      while (breakPos > 0 && renderer.getTextWidth(cachedFontId, line.substr(0, breakPos).c_str()) > allowedWidth) {
-        // Try to break at space
-        size_t spacePos = line.rfind(' ', breakPos - 1);
+        // Find break point（拆行逻辑，二分优化）
+        // 若当前源行首段需要缩进，则首段可用宽度要扣除缩进宽度。
+        const int allowedWidth =
+          viewportWidth - (cachedParagraphAlignment == CrossPointSettings::LEFT_ALIGN ? wordSpacing : 0) -
+          (doIndent ? indentWidth : 0);
+
+      auto alignUtf8Boundary = [&](size_t idx) -> size_t {
+        if (idx >= line.length()) return line.length();
+        while (idx > 0 && (static_cast<uint8_t>(line[idx]) & 0xC0) == 0x80) {
+          idx--;
+        }
+        return idx;
+      };
+
+      size_t low = 1;
+      size_t high = line.length();
+      size_t bestFit = 0;
+      while (low <= high) {
+        const size_t mid = low + (high - low) / 2;
+        size_t testPos = alignUtf8Boundary(mid);
+        if (testPos == 0) {
+          testPos = 1;
+        }
+
+        const int testWidth = renderer.getTextWidth(cachedFontId, line.substr(0, testPos).c_str());
+        if (testWidth <= allowedWidth) {
+          bestFit = testPos;
+          low = mid + 1;
+        } else {
+          if (testPos <= 1) {
+            break;
+          }
+          high = testPos - 1;
+        }
+      }
+
+      size_t breakPos = bestFit;
+      if (breakPos == 0) {
+        breakPos = alignUtf8Boundary(1);
+        if (breakPos == 0) {
+          breakPos = 1;
+        }
+      }
+
+      // 优先在可容纳范围内按空格断开（英文更自然）
+      if (breakPos > 1) {
+        const size_t spacePos = line.rfind(' ', breakPos - 1);
         if (spacePos != std::string::npos && spacePos > 0) {
           breakPos = spacePos;
-        } else {
-          // Break at character boundary for UTF-8
-          breakPos--;
-          // Make sure we don't break in the middle of a UTF-8 sequence
-          while (breakPos > 0 && (line[breakPos] & 0xC0) == 0x80) {
-            breakPos--;
+        }
+      }
+
+      // 行首标点避讳：尽量避免下一行以中文结束标点开头。
+      if (breakPos < line.length()) {
+        size_t nextLen = utf8CharLenAt(line, breakPos);
+        if (nextLen > 0) {
+          std::string nextUnit = line.substr(breakPos, nextLen);
+          if (isCjkLeadingPunctuation(nextUnit)) {
+            const int maxOverflow = std::max(1, allowedWidth / 20);  // 允许最多 5% 溢出
+            const int prevWidth = renderer.getTextWidth(cachedFontId, line.substr(0, breakPos).c_str()) +
+                                  (doIndent ? indentWidth : 0);
+            const int punctWidth = renderer.getTextWidth(cachedFontId, nextUnit.c_str());
+
+            // 优先将标点并入上一行（与 EPUB 的策略一致）
+            if (prevWidth + punctWidth <= allowedWidth + maxOverflow) {
+              breakPos += nextLen;
+            } else {
+              // 放不下则尝试回退断点，避免下一行首字符是禁忌标点。
+              while (breakPos > 1) {
+                size_t testLen = utf8CharLenAt(line, breakPos);
+                if (testLen == 0) {
+                  break;
+                }
+                const std::string testUnit = line.substr(breakPos, testLen);
+                if (!isCjkLeadingPunctuation(testUnit)) {
+                  break;
+                }
+                const size_t prevPos = prevUtf8Boundary(line, breakPos);
+                if (prevPos == breakPos || prevPos == 0) {
+                  break;
+                }
+                breakPos = prevPos;
+              }
+            }
           }
         }
       }
 
-      if (breakPos == 0) {
-        breakPos = 1;
+      // 拆行后的首段如果属于段首，仍需执行首行缩进。
+      if (doIndent) {
+        appendOutputLine(line.substr(0, breakPos), indentWidth);
+        needIndent = false;
+      } else {
+        appendOutputLine(line.substr(0, breakPos), 0);
       }
-
-      // 拆行后的行：完全不缩进，直接添加
-      outLines.push_back(line.substr(0, breakPos));
       isFirstWrappedLineOfSource = false;
 
       // Skip space at break point
@@ -568,9 +1039,15 @@ void TxtReaderActivity::renderPage() {
   // Render text lines with alignment
   auto renderLines = [&]() {
     int y = orientedMarginTop;
-    for (const auto& line : currentPageLines) {
+    const int lineVisualHeight = renderer.getLineHeight(cachedFontId);
+    const int lineXStart = orientedMarginLeft;
+    const int lineXEnd = renderer.getScreenWidth() - orientedMarginRight;
+    for (size_t i = 0; i < currentPageLines.size(); i++) {
+      const auto& line = currentPageLines[i];
       if (!line.empty()) {
-        int x = orientedMarginLeft;
+        const int indentOffset =
+            (i < currentPageIndentOffsets.size()) ? std::max(0, currentPageIndentOffsets[i]) : 0;
+        int x = orientedMarginLeft + indentOffset;
 
         // Apply text alignment
         switch (cachedParagraphAlignment) {
@@ -595,6 +1072,12 @@ void TxtReaderActivity::renderPage() {
         }
 
         renderer.drawText(cachedFontId, x, y, line.c_str());
+
+        // Keep line decoration in BW pass only; grayscale layers are text-AA data.
+        if (CrossPointSettings::getInstance().extraline && renderer.getRenderMode() == GfxRenderer::BW) {
+          const int dashY = y + lineVisualHeight + 2;
+          drawDashedLine(renderer, lineXStart, dashY, lineXEnd, true);
+        }
       }
       y += lineHeight;
     }
@@ -633,6 +1116,11 @@ void TxtReaderActivity::renderPage() {
     // Restore BW buffer
     renderer.restoreBwBuffer();
   }
+
+  if (!bluetoothBootstrapDone) {
+    bluetoothBootstrapDone = true;
+    initializeBluetoothAfterReaderRender();
+  }
 }
 
 
@@ -656,6 +1144,15 @@ void TxtReaderActivity::renderScreen() {
     return;
   }
 
+  if (pendingBookmarkPercent >= 0 && totalPages > 0) {
+    if (pendingBookmarkPercent >= 100) {
+      currentPage = totalPages - 1;
+    } else {
+      currentPage = static_cast<int>((static_cast<float>(pendingBookmarkPercent) / 100.0f) * totalPages);
+    }
+    pendingBookmarkPercent = -1;
+  }
+
 
   if (currentPage < 0) currentPage = 0;
   // 仅当currentPage超过总页数时修正（避免无效页码）
@@ -665,16 +1162,20 @@ void TxtReaderActivity::renderScreen() {
   size_t offset = pageOffsets[currentPage];
   size_t nextOffset;
   currentPageLines.clear();
+  currentPageIndentOffsets.clear();
   size_t endoffset = txt->getChapterendOffsetByIndex(chapternum);
   if (endoffset == 0 || endoffset <= offset) {
     endoffset = txt->getFileSize();
   }
-  loadPageAtOffset(offset,endoffset, currentPageLines, nextOffset);
+  loadPageAtOffset(offset, endoffset, currentPageLines, nextOffset, &currentPageIndentOffsets);
 
   renderer.clearScreen();
+    //加背景
+  if(SETTINGS.ReadingScreenEnabled){
+    Serial.printf("[%lu] [ERS] 壁纸屏幕开启，渲染壁纸屏幕\n");
+    renderPngSleepScreen(renderer);
+  }
   renderPage();
-
-
 }
 
 
@@ -889,8 +1390,7 @@ bool TxtReaderActivity::chapter_loadPageIndexCache(int chapternum) {
     return false;
   }
 
-  bool needIndent;
-  Serial.printf("[%lu] [TRS] first line indent: %d\n", millis(), needIndent);
+  bool needIndent = false;
   serialization::readPod(f, needIndent);
   if (needIndent != SETTINGS.firstlineintented) {
     Serial.printf("[%lu] [TRS] Cache first line indent mismatch, rebuilding\n", millis());
@@ -964,4 +1464,12 @@ void TxtReaderActivity::chapter_savePageIndexCache(int chapternum) const {
 
   f.close();
   Serial.printf("[%lu] [TRS] Saved page index cache: %d pages\n", millis(), totalPages);
+}
+void TxtReaderActivity::renderPngSleepScreen(GfxRenderer& renderer) const {
+  const std::string pxcPath = WALLPAPER_PXC_PATH;
+  if (loadWallpaperPxcToFramebuffer(pxcPath, renderer)) {
+    Serial.printf("[%lu] [SLP] Loaded wallpaper PXC cache\n", millis());
+    return;
+  }
+  Serial.printf("[%lu] [SLP] Wallpaper PXC missing, skip reader background\n", millis());
 }

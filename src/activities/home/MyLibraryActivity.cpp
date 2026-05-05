@@ -9,15 +9,37 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/StringUtils.h"
+#include <Utf8.h>
 //加入搜索
 #include "../util/KeyboardEntryActivity.h"
 
 
 namespace {
-constexpr int SKIP_PAGE_MS = 700;
 constexpr unsigned long GO_HOME_MS = 1000;
 //防止误删，把删除改为长按confirm
 constexpr int COPY_BUF_SIZE = 256; // 256字节缓冲区，适配小运存
+constexpr unsigned long SEARCH_ENTER_MS = 500;
+constexpr size_t MAX_SEARCH_RESULTS = 2048;
+constexpr int MAX_SEARCH_DEPTH = 16;
+constexpr size_t MAX_SEARCH_UTF8_CHARS = 2;
+constexpr size_t MAX_SEARCH_KEYBOARD_BYTES = 6;
+
+std::string utf8TakeFirstChars(const std::string& input, const size_t maxChars) {
+  if (maxChars == 0 || input.empty()) {
+    return "";
+  }
+
+  const auto* start = reinterpret_cast<const unsigned char*>(input.c_str());
+  const unsigned char* cursor = start;
+  size_t count = 0;
+  while (*cursor != '\0' && count < maxChars) {
+    utf8NextCodepoint(&cursor);
+    ++count;
+  }
+
+  const auto bytes = static_cast<size_t>(cursor - start);
+  return input.substr(0, bytes);
+}
 }  // namespace
 //把原来几个函数加上
 //删除
@@ -102,7 +124,11 @@ bool copyDir(const char* srcPath, const char* dstPath) {
 }
 
 // 递归搜索含关键词文件
-void searchFilesRecursive(const std::string& currentDir, const std::string& keyword, std::vector<std::string>& result) {
+void searchFilesRecursive(const std::string& currentDir, const std::string& keyword, std::vector<std::string>& result,
+                          const int depth = 0) {
+  if (depth > MAX_SEARCH_DEPTH || result.size() >= MAX_SEARCH_RESULTS) {
+    return;
+  }
   auto root = SdMan.open(currentDir.c_str());
   if (!root || !root.isDirectory()) {
     if (root) root.close();
@@ -123,12 +149,12 @@ void searchFilesRecursive(const std::string& currentDir, const std::string& keyw
     fullPath += name;
 
     if (file.isDirectory()) {
-      searchFilesRecursive(fullPath + "/", keyword, result);
+      searchFilesRecursive(fullPath + "/", keyword, result, depth + 1);
     } else {
       std::string fn = name;
-      std::transform(fn.begin(), fn.end(), fn.begin(), ::tolower);
+      std::transform(fn.begin(), fn.end(), fn.begin(), [](unsigned char c) { return static_cast<char>(tolower(c)); });
       std::string kw = keyword;
-      std::transform(kw.begin(), kw.end(), kw.begin(), ::tolower);
+      std::transform(kw.begin(), kw.end(), kw.begin(), [](unsigned char c) { return static_cast<char>(tolower(c)); });
 
       if (fn.find(kw) != std::string::npos) {
         if (StringUtils::checkFileExtension(fn, ".epub") ||
@@ -137,6 +163,10 @@ void searchFilesRecursive(const std::string& currentDir, const std::string& keyw
             StringUtils::checkFileExtension(fn, ".txt") ||
             StringUtils::checkFileExtension(fn, ".md")) {
           result.push_back(fullPath);
+          if (result.size() >= MAX_SEARCH_RESULTS) {
+            file.close();
+            break;
+          }
         }
       }
     }
@@ -155,9 +185,18 @@ void MyLibraryActivity::sortFileList(std::vector<std::string>& strs) {
 }
 // 执行搜索（接收char*关键词，适配100字符限制）
 void MyLibraryActivity::doSearch(const char* keyword) {
+  if (keyword == nullptr) {
+    return;
+  }
+  const std::string normalizedKeyword = utf8TakeFirstChars(std::string(keyword), MAX_SEARCH_UTF8_CHARS);
   // 安全拷贝关键词（防止超长，最多99字符+结束符）
-  strncpy(SEARCH_KEYWORD, keyword, sizeof(SEARCH_KEYWORD)-1);
+  strncpy(SEARCH_KEYWORD, normalizedKeyword.c_str(), sizeof(SEARCH_KEYWORD)-1);
   SEARCH_KEYWORD[sizeof(SEARCH_KEYWORD)-1] = '\0'; // 确保字符串结束
+
+  if (SEARCH_KEYWORD[0] == '\0') {
+    cancelSearch();
+    return;
+  }
 
   isSearchMode = true;
   originalBasePath = basepath;
@@ -169,6 +208,9 @@ void MyLibraryActivity::doSearch(const char* keyword) {
   
   sortFileList(searchResults);
   selectorIndex = 0;
+  // After search, default to selecting results with OPEN to avoid reopening keyboard by mistake.
+  topSelectorIndex = TopOption::OPEN;
+  topBarFocused = searchResults.empty();
   updateRequired = true;
   
   if (searchResults.empty()) {
@@ -182,16 +224,19 @@ void MyLibraryActivity::doSearch(const char* keyword) {
 }
 // 打开键盘输入Activity（核心修复）
 void MyLibraryActivity::executeSearch() {
-  // 清除现有子活动然后弹出输入框获取关键词
-  exitActivity();
+  // 弹出输入框获取关键词；如果已有子活动，先安全关闭
+  if (subActivity) {
+    exitActivity();
+  }
+  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
   updateRequired = true;
   enterNewActivity(new KeyboardEntryActivity(
       renderer, mappedInput, "输入搜索关键词", SEARCH_KEYWORD, 10,
-      63,     // 最大长度63，与其它地方保持一致
+      MAX_SEARCH_KEYBOARD_BYTES,
       false,  // 非密码模式
       [this](const std::string& keyword) {
           // 保存关键词；不要立即删除键盘（会在键盘自身loop中导致对象自毁)
-          std::string safeKeyword = keyword;
+          std::string safeKeyword = utf8TakeFirstChars(keyword, MAX_SEARCH_UTF8_CHARS);
           // 确保不超过数组大小（100字节）
           if (safeKeyword.size() >= sizeof(SEARCH_KEYWORD)) {
               safeKeyword = safeKeyword.substr(0, sizeof(SEARCH_KEYWORD) - 1);
@@ -205,12 +250,19 @@ void MyLibraryActivity::executeSearch() {
               static_cast<KeyboardEntryActivity*>(subActivity.get())->hide();
           }
           pendingSearch = true;
+            pendingCloseKeyboard = true;
+          suppressNextConfirmRelease = true;
           pendingKeyword = SEARCH_KEYWORD;
           updateRequired = true;
       },
       [this]() {
-          // 取消输入，仅请求退出子活动
+            // 取消输入，请求安全关闭键盘
           pendingSearch = false;
+            pendingCloseKeyboard = true;
+            suppressNextConfirmRelease = true;
+            if (subActivity) {
+              static_cast<KeyboardEntryActivity*>(subActivity.get())->hide();
+            }
           updateRequired = true;
       }));
 }
@@ -282,11 +334,35 @@ void MyLibraryActivity::onEnter() {
 
   renderingMutex = xSemaphoreCreateMutex();
 
+  // Support both directory path and full file path as initial input.
+  std::string initialSelectionName;
+  if (basepath.empty()) {
+    basepath = "/";
+  }
+  if (basepath != "/") {
+    auto initialPathHandle = SdMan.open(basepath.c_str());
+    const bool isDirectoryPath = initialPathHandle && initialPathHandle.isDirectory();
+    if (initialPathHandle) {
+      initialPathHandle.close();
+    }
+    if (!isDirectoryPath) {
+      const auto slashPos = basepath.find_last_of('/');
+      if (slashPos == std::string::npos) {
+        initialSelectionName = basepath;
+        basepath = "/";
+      } else {
+        initialSelectionName = basepath.substr(slashPos + 1);
+        basepath = (slashPos == 0) ? "/" : basepath.substr(0, slashPos);
+      }
+    }
+  }
+
   loadFiles();
 
-  selectorIndex = 0;
+  selectorIndex = initialSelectionName.empty() ? 0 : findEntry(initialSelectionName);
   //新增
   topSelectorIndex = TopOption::OPEN;
+  topBarFocused = true;
   copySourcePath = "";
   hasCopyData = false;
   isCutMode = false; 
@@ -324,10 +400,14 @@ void MyLibraryActivity::onExit() {
 void MyLibraryActivity::loop() {
   if (subActivity) {
       subActivity->loop();
+      if (pendingCloseKeyboard) {
+        exitActivity();
+        pendingCloseKeyboard = false;
+        updateRequired = true;
+      }
       // if a search was requested while the keyboard was running, close it now
       if (pendingSearch) {
           // perform exit after keyboard loop returns to avoid self-delete
-          exitActivity();
           doSearch(pendingKeyword.c_str());
           pendingSearch = false;
           updateRequired = true;
@@ -340,6 +420,10 @@ void MyLibraryActivity::loop() {
       pendingSearch = false;
       updateRequired = true;
   }
+    if (pendingCloseKeyboard) {
+      pendingCloseKeyboard = false;
+      updateRequired = true;
+    }
   // Long press BACK (1s+) goes to root folder
   if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= GO_HOME_MS &&
       basepath != "/") {
@@ -350,18 +434,64 @@ void MyLibraryActivity::loop() {
     return;
   }
  //新增开始
-   const bool topPrevPressed = mappedInput.wasReleased(MappedInputManager::Button::Left);
-  const bool topNextPressed = mappedInput.wasReleased(MappedInputManager::Button::Right);
-  
-  if (topPrevPressed) {
-    topSelectorIndex = (TopOption)(((int)topSelectorIndex - 1 + topOptionCount) % topOptionCount);
+  const bool upReleased = mappedInput.wasReleased(MappedInputManager::Button::Up);
+  const bool downReleased = mappedInput.wasReleased(MappedInputManager::Button::Down);
+  const bool leftReleased = mappedInput.wasReleased(MappedInputManager::Button::Left);
+  const bool rightReleased = mappedInput.wasReleased(MappedInputManager::Button::Right);
+  const bool confirmReleased = mappedInput.wasReleased(MappedInputManager::Button::Confirm);
+
+  // Avoid treating keyboard-close confirm as an action on search results.
+  if (suppressNextConfirmRelease && confirmReleased) {
+    suppressNextConfirmRelease = false;
     updateRequired = true;
-  } else if (topNextPressed) {
+    return;
+  }
+
+  const auto& displayList = isSearchMode ? searchResults : files;
+  const int listSize = static_cast<int>(displayList.size());
+
+  // 左右键：切换顶部功能
+  if (leftReleased) {
+    topSelectorIndex = (TopOption)(((int)topSelectorIndex + topOptionCount - 1) % topOptionCount);
+    topBarFocused = true;
+    updateRequired = true;
+  } else if (rightReleased) {
     topSelectorIndex = (TopOption)(((int)topSelectorIndex + 1) % topOptionCount);
+    topBarFocused = true;
     updateRequired = true;
   }
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+  // 上下键：切换文件选择
+  if (listSize > 0) {
+    if (upReleased) {
+      selectorIndex = (selectorIndex + static_cast<size_t>(listSize) - 1) % static_cast<size_t>(listSize);
+      topBarFocused = false;
+      updateRequired = true;
+    } else if (downReleased) {
+      selectorIndex = (selectorIndex + 1) % static_cast<size_t>(listSize);
+      topBarFocused = false;
+      updateRequired = true;
+    }
+  }
+
+  if (confirmReleased) {
+    // 搜索相关功能与文件选中无关，允许在空列表时触发
+    if (topSelectorIndex == TopOption::SEARCH) {
+      // if (mappedInput.getHeldTime() >= SEARCH_ENTER_MS) {
+      //   executeSearch();
+      // }
+      executeSearch();
+      updateRequired = true;
+      return;
+    }
+    if (topSelectorIndex == TopOption::CANCEL_SEARCH) {
+      cancelSearch();
+      updateRequired = true;
+      return;
+    }
+
+    TopOption action = topSelectorIndex;
+
     // ===== 新增：统一获取选中项的完整路径 =====
     std::string selectedItem;    // 选中的项（文件名/完整路径）
     std::string fullPath;        // 最终要操作的完整路径
@@ -389,7 +519,7 @@ void MyLibraryActivity::loop() {
     if (!hasValidSelection) return;
 
     // ===== 原有逻辑全部改用 fullPath/selectedItem，不再用 files[selectorIndex] =====
-    switch (topSelectorIndex) {
+    switch (action) {
       case TopOption::OPEN: 
         if (isSearchMode) {
           // 搜索模式：直接打开（selectedItem是完整路径，且只有文件）
@@ -416,7 +546,7 @@ void MyLibraryActivity::loop() {
           deleteFileOrDir(fullPath); // 改用统一的fullPath
           // 删除后刷新列表（区分模式）
           if (isSearchMode) {
-            executeSearch(); // 搜索模式：重新搜索
+            doSearch(SEARCH_KEYWORD); // 搜索模式：直接重跑当前关键词
           } else {
             loadFiles();     // 普通模式：重新加载
           }
@@ -468,21 +598,16 @@ void MyLibraryActivity::loop() {
         copySourcePath = "";
         // 粘贴后刷新列表（区分模式）
         if (isSearchMode) {
-          executeSearch();
+          doSearch(SEARCH_KEYWORD);
         } else {
           loadFiles();
         }
         break;
       }
 
-      // case TopOption::SEARCH:
-      //   if (!isSearchMode) {
-      //     executeSearch();
-      //   }
-      //   break;
-      // case TopOption::CANCEL_SEARCH:
-      //   cancelSearch();
-      //   break;
+      case TopOption::SEARCH:
+      case TopOption::CANCEL_SEARCH:
+        break;
     }
     updateRequired = true;
     return;
@@ -493,13 +618,6 @@ void MyLibraryActivity::loop() {
 
 
   //新增结束
-  const bool upReleased = mappedInput.wasReleased(MappedInputManager::Button::Up);
-  ;
-  const bool downReleased = mappedInput.wasReleased(MappedInputManager::Button::Down);
-
-  const bool skipPage = mappedInput.getHeldTime() > SKIP_PAGE_MS;
-  const int pageItems = UITheme::getInstance().getNumberOfItemsPerPage(renderer, true, false, true, false);
-
   //把文件打开的逻辑放上面了
   //这里去掉了
   //后面没动
@@ -528,23 +646,6 @@ if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
   }
 }
 
-  const auto& displayList = isSearchMode ? searchResults : files;
-  int listSize = static_cast<int>(displayList.size());
-  if (upReleased) {
-    if (skipPage) {
-      selectorIndex = std::max(static_cast<int>((selectorIndex / pageItems - 1) * pageItems), 0);
-    } else {
-      selectorIndex = (selectorIndex + listSize - 1) % listSize;
-    }
-    updateRequired = true;
-  } else if (downReleased) {
-    if (skipPage) {
-      selectorIndex = std::min(static_cast<int>((selectorIndex / pageItems + 1) * pageItems), listSize - 1);
-    } else {
-      selectorIndex = (selectorIndex + 1) % listSize;
-    }
-    updateRequired = true;
-  }
 }
 
 
@@ -560,7 +661,13 @@ void MyLibraryActivity::displayTaskLoop() {
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
-
+std::string getFileName(std::string filename) {
+  if (filename.back() == '/') {
+    return filename.substr(0, filename.length() - 1);
+  }
+  const auto pos = filename.rfind('.');
+  return filename.substr(0, pos);
+}
 //添加四个按钮：删除、复制、剪切、粘贴
 //添加搜索和取消搜索
 void MyLibraryActivity::render() const {
@@ -571,41 +678,22 @@ void MyLibraryActivity::render() const {
   auto metrics = UITheme::getInstance().getMetrics();
   auto folderName = basepath == "/" ? "SD card" : basepath.substr(basepath.rfind('/') + 1).c_str();
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, folderName);
-  //开始添加
-  //constexpr const char* topItems[7] = {"打开", "删除", "复制", "剪切", "粘贴", "搜索", "取消搜索"};
-  constexpr const char* topItems[5] = {"打开", "删除", "复制", "剪切", "粘贴"};
-  constexpr int margin = 10;
-  constexpr int menuSpacing = 5;
-  const int menuTileWidth = (pageWidth - 2 * margin - 3 * menuSpacing) / 4;
-  constexpr int menuTileHeight = 30;
-  constexpr int topMenuY = 15;
- // 分页显示（一行3个）防止挡电源
-  int startIdx = ((int)topSelectorIndex / 3) * 3;
-  if (startIdx + 3 > 5) startIdx = 3;
+  std::vector<TabInfo> topTabs;
+  topTabs.reserve(topOptionCount);
+  topTabs.push_back({"打开", topSelectorIndex == TopOption::OPEN});
+  topTabs.push_back({"删除", topSelectorIndex == TopOption::DELETE});
+  topTabs.push_back({"复制", topSelectorIndex == TopOption::COPY});
+  topTabs.push_back({"剪切", topSelectorIndex == TopOption::CUT});
+  topTabs.push_back({"粘贴", topSelectorIndex == TopOption::PASTE});
+  topTabs.push_back({"搜索", topSelectorIndex == TopOption::SEARCH});
+  topTabs.push_back({"退出搜索", topSelectorIndex == TopOption::CANCEL_SEARCH});
 
-  for (int i = 0; i < 3; i++) {
-    int btnIdx = startIdx + i;
-    if (btnIdx >= 5) break;
-    
-    int tileX = margin + i * (menuTileWidth + menuSpacing);
-    int tileY = topMenuY;
-    bool selected = (TopOption)btnIdx == topSelectorIndex;
-
-    if (selected) {
-      renderer.fillRect(tileX, tileY, menuTileWidth, menuTileHeight);
-    } else {
-      renderer.drawRect(tileX, tileY, menuTileWidth, menuTileHeight);
-    }
-
-    int buttonCenterY = tileY;
-    int textX = tileX + (menuTileWidth - renderer.getTextWidth(UI_10_FONT_ID, topItems[btnIdx])) / 2;
-    renderer.drawText(UI_10_FONT_ID, textX, buttonCenterY, topItems[btnIdx], !selected, EpdFontFamily::BOLD);
-  }
-  //添加结束
+  GUI.drawTabBar(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight}, topTabs,
+                 topBarFocused);
 
 
 
-  const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
+  const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing;
   const int contentHeight = pageHeight - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing;
 
   // 核心：根据是否搜索模式，选择要显示的列表（files 或 searchResults）
@@ -624,15 +712,19 @@ void MyLibraryActivity::render() const {
       // 绘制列表时，用 displayList 替代原来的 files
       GUI.drawList(
           renderer, Rect{0, contentTop, pageWidth, contentHeight}, displayList.size(), selectorIndex,
-          [this](int index) { 
-              // 这里返回当前模式下的列表项
-              return isSearchMode ? searchResults[index] : files[index]; 
-          }, nullptr, nullptr, nullptr);
+        [this](int index) {
+          const auto& entry = isSearchMode ? searchResults[index] : files[index];
+          return getFileName(entry);
+        }, nullptr,
+        [this](int index) {
+          const auto& entry = isSearchMode ? searchResults[index] : files[index];
+          return UITheme::getFileIcon(entry);
+        }, nullptr);
   }
   //侧边绘制，防止有的用户问
   GUI.drawSideButtonHints(renderer, "向上", "向下");
   // Help text
-  const auto labels = mappedInput.mapLabels("« 返回", "选择", "左选", "右选");
+  const auto labels = mappedInput.mapLabels("« 返回", "确认", "向左", "向右");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   renderer.displayBuffer();

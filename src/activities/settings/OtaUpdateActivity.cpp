@@ -1,5 +1,7 @@
 #include "OtaUpdateActivity.h"
 
+#include <cstdio>
+
 #include <GfxRenderer.h>
 #include <WiFi.h>
 
@@ -40,14 +42,14 @@ void OtaUpdateActivity::onWifiSelectionComplete(const bool success) {
     return;
   }
 
-  if (!updater.isUpdateNewer()) {
-    Serial.printf("[%lu] [OTA] No new update available\n", millis());
-    xSemaphoreTake(renderingMutex, portMAX_DELAY);
-    state = NO_UPDATE;
-    xSemaphoreGive(renderingMutex);
-    updateRequired = true;
-    return;
-  }
+  // if (!updater.isUpdateNewer()) {
+  //   Serial.printf("[%lu] [OTA] No new update available\n", millis());
+  //   xSemaphoreTake(renderingMutex, portMAX_DELAY);
+  //   state = NO_UPDATE;
+  //   xSemaphoreGive(renderingMutex);
+  //   updateRequired = true;
+  //   return;
+  // }
 
   xSemaphoreTake(renderingMutex, portMAX_DELAY);
   state = WAITING_CONFIRMATION;
@@ -114,19 +116,29 @@ void OtaUpdateActivity::render() {
     return;
   }
 
-  float updaterProgress = 0;
   if (state == UPDATE_IN_PROGRESS) {
-    Serial.printf("[%lu] [OTA] Update progress: %d / %d\n", millis(), updater.getProcessedSize(),
-                  updater.getTotalSize());
-    updaterProgress = static_cast<float>(updater.getProcessedSize()) / static_cast<float>(updater.getTotalSize());
-    // Only update every 2% at the most
-    if (static_cast<int>(updaterProgress * 50) == lastUpdaterPercentage / 2) {
+    const unsigned long now = millis();
+    const size_t downloaded = updater.getProcessedSize();
+
+    if (lastSpeedSampleMs == 0) {
+      lastSpeedSampleMs = now;
+      lastSpeedSampleBytes = downloaded;
+      lastSpeedKBps = 0.0f;
+    } else if (now > lastSpeedSampleMs && (now - lastSpeedSampleMs) >= 1000) {
+      const size_t deltaBytes = (downloaded >= lastSpeedSampleBytes) ? (downloaded - lastSpeedSampleBytes) : 0;
+      const float elapsedSec = static_cast<float>(now - lastSpeedSampleMs) / 1000.0f;
+      lastSpeedKBps = (elapsedSec > 0.0f) ? (static_cast<float>(deltaBytes) / 1024.0f / elapsedSec) : 0.0f;
+      lastSpeedSampleMs = now;
+      lastSpeedSampleBytes = downloaded;
+    }
+
+    // Refresh roughly every 400ms, or immediately when size changes.
+    if (downloaded == lastShownDownloadedBytes && (now - lastDownloadUiUpdateMs) < 400) {
       return;
     }
-    lastUpdaterPercentage = static_cast<int>(updaterProgress * 100);
+    lastShownDownloadedBytes = downloaded;
+    lastDownloadUiUpdateMs = now;
   }
-
-  const auto pageWidth = renderer.getScreenWidth();
 
   renderer.clearScreen();
   renderer.drawCenteredText(UI_12_FONT_ID, 15, "Update", true, EpdFontFamily::BOLD);
@@ -149,23 +161,41 @@ void OtaUpdateActivity::render() {
   }
 
   if (state == UPDATE_IN_PROGRESS) {
+    auto formatSize = [](size_t bytes) -> std::string {
+      const float kb = 1024.0f;
+      const float mb = 1024.0f * 1024.0f;
+      char buf[32] = {0};
+      if (bytes >= mb) {
+        snprintf(buf, sizeof(buf), "%.2f MB", static_cast<float>(bytes) / mb);
+      } else {
+        snprintf(buf, sizeof(buf), "%.1f KB", static_cast<float>(bytes) / kb);
+      }
+      return std::string(buf);
+    };
+
+    const size_t downloaded = updater.getProcessedSize();
+    const size_t total = updater.getTotalSize();
+
     renderer.drawCenteredText(UI_10_FONT_ID, 310, "Updating...", true, EpdFontFamily::BOLD);
-    renderer.drawRect(20, 350, pageWidth - 40, 50);
-    renderer.fillRect(24, 354, static_cast<int>(updaterProgress * static_cast<float>(pageWidth - 44)), 42);
-    renderer.drawCenteredText(UI_10_FONT_ID, 420,
-                              (std::to_string(static_cast<int>(updaterProgress * 100)) + "%").c_str());
-    renderer.drawCenteredText(
-        UI_10_FONT_ID, 440,
-        (std::to_string(updater.getProcessedSize()) + " / " + std::to_string(updater.getTotalSize())).c_str());
+    renderer.drawCenteredText(UI_10_FONT_ID, 360, "Downloaded", true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, 400, formatSize(downloaded).c_str());
+    if (total > 0) {
+      renderer.drawCenteredText(UI_10_FONT_ID, 440, ("Total: " + formatSize(total)).c_str());
+    } else {
+      renderer.drawCenteredText(UI_10_FONT_ID, 440, "Total size: unknown");
+    }
+    char speedBuf[32] = {0};
+    snprintf(speedBuf, sizeof(speedBuf), "Speed: %.1f KB/s", lastSpeedKBps);
+    renderer.drawCenteredText(UI_10_FONT_ID, 460, speedBuf);
     renderer.displayBuffer();
     return;
   }
 
-  if (state == NO_UPDATE) {
-    renderer.drawCenteredText(UI_10_FONT_ID, 300, "No update available", true, EpdFontFamily::BOLD);
-    renderer.displayBuffer();
-    return;
-  }
+  // if (state == NO_UPDATE) {
+  //   renderer.drawCenteredText(UI_10_FONT_ID, 300, "No update available", true, EpdFontFamily::BOLD);
+  //   renderer.displayBuffer();
+  //   return;
+  // }
 
   if (state == FAILED) {
     renderer.drawCenteredText(UI_10_FONT_ID, 300, "Update failed", true, EpdFontFamily::BOLD);
@@ -193,6 +223,11 @@ void OtaUpdateActivity::loop() {
       Serial.printf("[%lu] [OTA] New update available, starting download...\n", millis());
       xSemaphoreTake(renderingMutex, portMAX_DELAY);
       state = UPDATE_IN_PROGRESS;
+      lastDownloadUiUpdateMs = 0;
+      lastShownDownloadedBytes = 0;
+      lastSpeedSampleMs = 0;
+      lastSpeedSampleBytes = 0;
+      lastSpeedKBps = 0.0f;
       xSemaphoreGive(renderingMutex);
       updateRequired = true;
       vTaskDelay(10 / portTICK_PERIOD_MS);

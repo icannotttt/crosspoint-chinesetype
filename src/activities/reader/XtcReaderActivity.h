@@ -21,6 +21,9 @@ class XtcReaderActivity final : public ActivityWithSubactivity {
   uint32_t currentPage = 0;
   int pagesUntilFullRefresh = 0;
   bool updateRequired = false;
+  bool skipNextButtonCheck = false;
+  bool bluetoothBootstrapDone = false;  // Run Bluetooth startup logic only once after first render
+  unsigned long lastAutoPageTurnMs = 0;
   const std::function<void()> onGoBack;
   const std::function<void()> onGoHome;
 

@@ -27,7 +27,6 @@ constexpr char CUSTOM_SLEEP_PXC[] = "/.crosspoint/custom_sleep.pxc";
 constexpr uint8_t FIXED_CACHE_ORIENTATION = CrossPointSettings::ORIENTATION::PORTRAIT;
 
 
-//通篇已经在必要部分把HALF_REFRESH改成FULL_REFRESH了，防止残影过重
 bool loadWallpaperPxcToFramebuffer(const std::string& pxcPath, GfxRenderer& renderer, const uint8_t orientation) {
   FsFile input;
   if (!SdMan.openFileForRead("SLP", pxcPath, input)) {
@@ -158,16 +157,13 @@ void SleepActivity::onEnter() {
   switch (SETTINGS.sleepScreen) {
     case (CrossPointSettings::SLEEP_SCREEN_MODE::BLANK):
     GUI.drawPopup(renderer, "Entering Sleep...");
-    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
       return renderBlankSleepScreen();
     case (CrossPointSettings::SLEEP_SCREEN_MODE::CUSTOM):
     GUI.drawPopup(renderer, "Entering Sleep...");
-    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
       return renderCustomSleepScreen();
     case (CrossPointSettings::SLEEP_SCREEN_MODE::COVER):
     case (CrossPointSettings::SLEEP_SCREEN_MODE::COVER_CUSTOM):
     GUI.drawPopup(renderer, "Entering Sleep...");
-    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
       return renderCoverSleepScreen();
     case (CrossPointSettings::SLEEP_SCREEN_MODE::MARSK):
       return renderpngtxtSleepScreen();
@@ -175,7 +171,6 @@ void SleepActivity::onEnter() {
       return renderPngSleepScreen();
     default:
     GUI.drawPopup(renderer, "Entering Sleep...");
-    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
       return renderDefaultSleepScreen();
   }
 }
@@ -238,7 +233,7 @@ void SleepActivity::renderpngtxtSleepScreen() const {
         
         // 绘制PNGTXT（灰阶分层绘制）
         renderer.drawPngFromTxtpng(filename.c_str());
-        renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+        renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 
         renderer.clearScreen(0x00);
         renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
@@ -273,7 +268,7 @@ void SleepActivity::renderpngtxtSleepScreen() const {
       
       // 绘制PNGTXT（灰阶分层绘制）
       renderer.drawPngFromTxtpng(pngtxtPath.c_str());
-      renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+      renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 
       renderer.clearScreen(0x00);
       renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
@@ -390,7 +385,7 @@ void SleepActivity::renderCustomSleepScreen() const {
 void SleepActivity::renderPngSleepScreen() const {
   if (overlayTransparentPxaToFramebuffer(TRANSPARENT_WALLPAPER2_PXA, renderer, SETTINGS.orientation)) {
     Serial.printf("[%lu] [SLP] Loaded transparent wallpaper2 PXA cache\n", millis());
-    renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
     return;
   }
 
@@ -485,7 +480,7 @@ void SleepActivity::renderPngSleepScreen() const {
     // 解码并渲染根目录的sleep_mask.png
     PngToFramebufferConverter pngConverter;
     if (pngConverter.decodeToFramebuffer("/sleep_mask.png", renderer, renderConfig)) {
-      renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
       delay(200);
       Serial.printf("[%lu] [SLP] Png draw completed (mode: %d)\n", millis(), renderer.getRenderMode());
       return;
@@ -513,7 +508,7 @@ void SleepActivity::renderDefaultSleepScreen() const {
     renderer.invertScreen();
   }
 
-  renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 }
 
 void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap) const {
@@ -673,5 +668,5 @@ void SleepActivity::renderCoverSleepScreen() const {
 
 void SleepActivity::renderBlankSleepScreen() const {
   renderer.clearScreen();
-  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 }

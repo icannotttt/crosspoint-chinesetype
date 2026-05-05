@@ -3,6 +3,7 @@
 #include <GfxRenderer.h>
 
 #include "MappedInputManager.h"
+#include "components/UITheme.h"
 #include "fontIds.h"
 #include "Xtc.h"
 
@@ -15,16 +16,7 @@ int page = 1;
 }  // namespace
 
 int XtcReaderChapterSelectionActivity::getPageItems() const {
-  constexpr int startY = 60;
-  constexpr int lineHeight = 30;
-
-  const int screenHeight = renderer.getScreenHeight();
-  const int availableHeight = screenHeight - startY;
-  int items = availableHeight / lineHeight;
-  if (items < 1) {
-    items = 1;
-  }
-  return items;
+  return std::max(1, UITheme::getNumberOfItemsPerPage(renderer, true, false, true, false));
 }
 
 void XtcReaderChapterSelectionActivity::taskTrampoline(void* param) {
@@ -142,36 +134,34 @@ void XtcReaderChapterSelectionActivity::renderScreen() {
     parsedPage = page;
   }
 
-  const auto pageWidth = renderer.getScreenWidth();
-  renderer.drawCenteredText(UI_12_FONT_ID, 15, "目录", true, EpdFontFamily::BOLD);
+  const int pageWidth = renderer.getScreenWidth();
+  const int pageHeight = renderer.getScreenHeight();
+  const auto metrics = UITheme::getInstance().getMetrics();
 
-  const int FIX_LINE_HEIGHT = 29;
-  const int BASE_Y = 60;
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, "目录");
 
-  
-  for (int i = pagebegin; i <= pagebegin + page_chapter - 1; i++) {
-      int localIdx = i - pagebegin; 
-      
-      uint32_t currOffset = this->xtc->getChapterstartpage(i); 
-      std::string dirTitle = this->xtc->getChapterTitleByIndex(i); 
-      
-      Serial.printf("[%lu] [XTC_CHAPTER] 第%d章，名字为:%s,页码为%d\n", millis(), i, dirTitle.c_str(),currOffset);
-      static char title[64];
-      strncpy(title, dirTitle.c_str(), sizeof(title)-1);
-      title[sizeof(title)-1] = '\0';
-      
-      int drawY = BASE_Y + localIdx * FIX_LINE_HEIGHT; // 
-      if (i == selectorIndex) {
-        renderer.fillRect(0, drawY, renderer.getScreenWidth(), FIX_LINE_HEIGHT);
-        renderer.drawText(UI_10_FONT_ID, 20, drawY, title, 0);
-      } else {
-        //renderer.drawRect(0, drawY, 480, FIX_LINE_HEIGHT);
-        renderer.drawText(UI_10_FONT_ID, 20, drawY, title, 1);
-      }
+  const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
+  const int contentHeight =
+      std::max(0, pageHeight - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing);
+    const int selectedRow = std::max(0, std::min(page_chapter - 1, selectorIndex - pagebegin));
 
-      //Serial.printf("选中的选项是：%d\n",selectorIndex); // ✅ 补全换行符，日志整洁
-      //renderer.drawText(UI_10_FONT_ID, 20, drawY, title, i!= selectorIndex); // ✅ 核心修复：选中态正常，必加！
-  }
+  GUI.drawList(
+      renderer, Rect{0, contentTop, pageWidth, contentHeight}, page_chapter, selectedRow,
+      [this, pagebegin](int index) {
+        const int chapterIndex = pagebegin + index;
+        std::string title = this->xtc->getChapterTitleByIndex(chapterIndex);
+        if (title.empty()) {
+          title = "(未命名章节)";
+        }
+        return title;
+      },
+      nullptr, nullptr, [this, pagebegin](int index) {
+        const int chapterIndex = pagebegin + index;
+        return std::to_string(this->xtc->getChapterstartpage(chapterIndex));
+      });
+
+  const auto labels = mappedInput.mapLabels("« 返回", "选择", "向上", "向下");
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   renderer.displayBuffer();
 }

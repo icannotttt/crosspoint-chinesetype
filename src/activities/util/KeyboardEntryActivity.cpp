@@ -15,8 +15,9 @@ const char* const KeyboardEntryActivity::keyboard[NUM_ROWS] = {
 };
 
 // Keyboard layouts - uppercase/symbols
+// Keep SPECIAL ROW at index 5 so it stays a non-rendered placeholder for the bottom function row.
 const char* const KeyboardEntryActivity::keyboardShift[NUM_ROWS] = {"~!@#$%^&*()_+", "QWERTYUIOP{}|", "ASDFGHJKL:\"",
-                                                                    "ZXCVBNM<>?", "SPECIAL ROW"};
+                                                                    "ZXCVBNM<>?", "ZXCVBNM<>?", "SPECIAL ROW"};
 
 // Shift state strings
 const char* const KeyboardEntryActivity::shiftString[3] = {"shift", "SHIFT", "LOCK"};
@@ -76,7 +77,7 @@ int KeyboardEntryActivity::getRowLength(const int row) const {
   // Return actual length of each row based on keyboard layout
   switch (row) {
     case 0:
-      return 2;
+      return shiftState == 0 ? 2 : 13;  // lower: QR+OK, shift/lock: symbols row
     case 1:
       return 13;  // `1234567890-=
     case 2:
@@ -102,10 +103,19 @@ char KeyboardEntryActivity::getSelectedChar() const {
 }
 
 void KeyboardEntryActivity::handleKeyPress() {
-  if (selectedCol ==0 && selectedRow == 0) {
-    // QR button - start web input server and show QR screen
-    startWebInputServer();
-    return;
+  if (selectedRow == TOP_ROW && shiftState == 0) {
+    if (selectedCol == TOP_QR_COL) {
+      // QR button - start web input server and show QR screen
+      startWebInputServer();
+      return;
+    }
+    if (selectedCol == TOP_OK_COL) {
+      // Top-row OK button in normal mode
+      if (onComplete) {
+        onComplete(text);
+      }
+      return;
+    }
   }
   // Handle special row (bottom row with shift, space, backspace, QR, done)
   if (selectedRow == SPECIAL_ROW) {
@@ -197,9 +207,9 @@ void KeyboardEntryActivity::loop() {
       selectedRow = NUM_ROWS - 1;
     }
     // Clamp column to valid range for new row
-    if (selectedRow == 0) {
-      // always land on QR key when moving into top row
-      selectedCol = 0;
+    if (selectedRow == TOP_ROW) {
+      const int maxCol = getRowLength(TOP_ROW) - 1;
+      if (selectedCol > maxCol) selectedCol = maxCol;
     } else {
       const int maxCol = getRowLength(selectedRow) - 1;
       if (selectedCol > maxCol) selectedCol = maxCol;
@@ -223,8 +233,9 @@ void KeyboardEntryActivity::loop() {
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
     const int maxCol = getRowLength(selectedRow) - 1;
-    if (selectedRow == 0) {
-      selectedCol = 0;
+    if (selectedRow == TOP_ROW) {
+      const int topMaxCol = getRowLength(TOP_ROW) - 1;
+      if (selectedCol > topMaxCol) selectedCol = topMaxCol;
     }
     // Special bottom row case
     if (selectedRow == SPECIAL_ROW) {
@@ -257,9 +268,10 @@ void KeyboardEntryActivity::loop() {
 
     if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
     const int maxCol = getRowLength(selectedRow) - 1;
-      if (selectedRow == 0) {
-      selectedCol = 0;
-      }
+    if (selectedRow == TOP_ROW) {
+      const int topMaxCol = getRowLength(TOP_ROW) - 1;
+      if (selectedCol > topMaxCol) selectedCol = topMaxCol;
+    }
     // Special bottom row case
     if (selectedRow == SPECIAL_ROW) {
       // Bottom row has special key widths
@@ -314,16 +326,20 @@ void KeyboardEntryActivity::render() const {
   }
 
   const auto pageWidth = renderer.getScreenWidth();
+  const auto pageHeight = renderer.getScreenHeight();
+  const auto metrics = UITheme::getInstance().getMetrics();
+  constexpr int INPUT_FONT = UI_12_FONT_ID;
+  constexpr int KEY_FONT = UI_10_FONT_ID;
 
   renderer.clearScreen();
 
-  // Draw title
-  renderer.drawCenteredText(UI_10_FONT_ID, startY, title.c_str());
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, title.c_str());
 
   // Draw input field
-  const int inputStartY = startY + 22;
-  int inputEndY = startY + 22;
-  renderer.drawText(UI_10_FONT_ID, 10, inputStartY, "[");
+  const int lineHeight = renderer.getLineHeight(INPUT_FONT);
+  const int inputStartY =
+      metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing + metrics.verticalSpacing * 4;
+  int inputHeight = 0;
 
   std::string displayText;
   if (isPassword) {
@@ -338,113 +354,131 @@ void KeyboardEntryActivity::render() const {
   // Render input text across multiple lines
   int lineStartIdx = 0;
   int lineEndIdx = displayText.length();
+  int textWidth = 0;
   while (true) {
     std::string lineText = displayText.substr(lineStartIdx, lineEndIdx - lineStartIdx);
-    const int textWidth = renderer.getTextWidth(UI_10_FONT_ID, lineText.c_str());
-    if (textWidth <= pageWidth - 40) {
-      renderer.drawText(UI_10_FONT_ID, 20, inputEndY, lineText.c_str());
+    textWidth = renderer.getTextWidth(INPUT_FONT, lineText.c_str());
+    if (textWidth <= pageWidth - 2 * metrics.contentSidePadding) {
+      renderer.drawText(INPUT_FONT, metrics.contentSidePadding, inputStartY + inputHeight, lineText.c_str());
       if (lineEndIdx == displayText.length()) {
         break;
       }
 
-      inputEndY += renderer.getLineHeight(UI_10_FONT_ID);
+      inputHeight += lineHeight;
       lineStartIdx = lineEndIdx;
       lineEndIdx = displayText.length();
     } else {
       lineEndIdx -= 1;
     }
   }
-  renderer.drawText(UI_10_FONT_ID, pageWidth - 15, inputEndY, "]");
 
-  // Draw keyboard - use compact spacing to fit 5 rows on screen
-  const int keyboardStartY = inputEndY + 25;
-  constexpr int keyWidth = 18;
-  constexpr int keyHeight = 18;
-  constexpr int keySpacing = 3;
+  const int inputBoxY = inputStartY - metrics.verticalSpacing / 2;
+  const int inputBoxH = inputHeight + lineHeight + metrics.verticalSpacing;
+  renderer.drawRoundedRect(metrics.contentSidePadding / 2, inputBoxY, pageWidth - metrics.contentSidePadding,
+                           inputBoxH, 2, 8, true);
+
+  // Draw keyboard: vertically centered in available area, each row spans full screen width.
+  constexpr int keyHeight = 30;
+  constexpr int keySpacingY = 5;
+  constexpr int keySpacingX = 2;
+  constexpr int keySidePadding = 5;
+  const int keyboardHeight = NUM_ROWS * keyHeight + (NUM_ROWS - 1) * keySpacingY;
+  const int keyboardTopBound = inputBoxY + inputBoxH + metrics.verticalSpacing * 2;
+  const int keyboardBottomBound = pageHeight - metrics.buttonHintsHeight - metrics.verticalSpacing * 2;
+  int keyboardStartY = keyboardTopBound + (keyboardBottomBound - keyboardTopBound - keyboardHeight) / 2;
+  if (keyboardStartY < keyboardTopBound) {
+    keyboardStartY = keyboardTopBound;
+  }
+
+  const auto drawKey = [&](const Rect& r, const char* label, const bool selected) {
+    if (selected) {
+      renderer.fillRoundedRect(r.x, r.y, r.width, r.height, 5, LightGray);
+      renderer.drawRoundedRect(r.x, r.y, r.width, r.height, 1, 5, true);
+    } else {
+      renderer.fillRoundedRect(r.x, r.y, r.width, r.height, 5, White);
+      renderer.drawRoundedRect(r.x, r.y, r.width, r.height, 1, 5, true);
+    }
+
+    const int textWidthLocal = renderer.getTextWidth(KEY_FONT, label);
+    const int textX = r.x + (r.width - textWidthLocal) / 2;
+    const int textY = r.y + (r.height - renderer.getLineHeight(KEY_FONT)) / 2;
+    renderer.drawText(KEY_FONT, textX, textY, label, true);
+  };
 
   const char* const* layout = shiftState ? keyboardShift : keyboard;
 
-  // Calculate left margin to center the longest row (13 keys)
-  constexpr int maxRowWidth = KEYS_PER_ROW * (keyWidth + keySpacing);
-  const int leftMargin = (pageWidth - maxRowWidth) / 2;
-  for (int row = 0; row < 1; row++) {
-    const int rowY = keyboardStartY + row * (keyHeight + keySpacing);
-    const int startX = leftMargin;
-    // QR button (logical col 9, spans 2 key widths)
-    const bool QRSelected = (selectedRow == 0);
-    renderItemWithSelector(startX + 2, rowY, "QR", QRSelected);
-  }
+  for (int row = 0; row < NUM_ROWS; row++) {
+    const int rowY = keyboardStartY + row * (keyHeight + keySpacingY);
+    const int rowLength = getRowLength(row);
+    const int rowContentWidth = pageWidth - keySidePadding * 2 - (rowLength - 1) * keySpacingX;
+    const auto unitX = [&](const int unit) {
+      return keySidePadding + unit * keySpacingX + (unit * rowContentWidth) / rowLength;
+    };
 
-  for (int row = 1; row < NUM_ROWS; row++) {
-    const int rowY = keyboardStartY + row * (keyHeight + keySpacing);
+    if (row == TOP_ROW && shiftState == 0) {
+      const int qrX = unitX(TOP_QR_COL);
+      const int qrW = unitX(TOP_QR_COL + 1) - qrX;
+      const bool qrSelected = (selectedRow == TOP_ROW && selectedCol == TOP_QR_COL);
+      drawKey(Rect{qrX, rowY, qrW, keyHeight}, "QR", qrSelected);
 
-    // Left-align all rows for consistent navigation
-    const int startX = leftMargin;
+      const int okX = unitX(TOP_OK_COL);
+      const int okW = unitX(TOP_OK_COL + 1) - okX;
+      const bool okSelected = (selectedRow == TOP_ROW && selectedCol == TOP_OK_COL);
+      drawKey(Rect{okX, rowY, okW, keyHeight}, "OK", okSelected);
+      continue;
+    }
 
     // Handle bottom row (row 4) specially with proper multi-column keys
-    if (row == 5) {
-      // Bottom row layout: SHIFT (2 cols) | SPACE (5 cols) | <- (2 cols) | OK (2 cols)
-      // Total: 11 visual columns, but we use logical positions for selection
+    if (row == SPECIAL_ROW) {
+      // Bottom row layout: SHIFT (2 cols) | SPACE (4 cols) | <- (2 cols) | OK (2 cols)
 
-      int currentX = startX;
+      int currentX = unitX(0);
 
-      // SHIFT key (logical col 0, spans 2 key widths)
-      const bool shiftSelected = (selectedRow == 5 && selectedCol >= SHIFT_COL && selectedCol < SPACE_COL);
-      renderItemWithSelector(currentX + 2, rowY, shiftString[shiftState], shiftSelected);
-      currentX += 2 * (keyWidth + keySpacing);
+      // SHIFT key (logical col 0-1)
+      const bool shiftSelected = (selectedRow == SPECIAL_ROW && selectedCol >= SHIFT_COL && selectedCol < SPACE_COL);
+      const int shiftWidth = SPACE_COL - SHIFT_COL;
+      const int shiftXWidth = unitX(SHIFT_COL + shiftWidth) - unitX(SHIFT_COL);
+      drawKey(Rect{currentX, rowY, shiftXWidth, keyHeight}, shiftString[shiftState], shiftSelected);
+      currentX = unitX(SPACE_COL);
 
-      // Space bar (logical cols 2-6, spans 5 key widths)
-      const bool spaceSelected = (selectedRow == 5 && selectedCol >= SPACE_COL && selectedCol < BACKSPACE_COL);
-      const int spaceTextWidth = renderer.getTextWidth(UI_10_FONT_ID, "_____");
-      const int spaceXWidth = 5 * (keyWidth + keySpacing);
-      const int spaceXPos = currentX + (spaceXWidth - spaceTextWidth) / 2;
-      renderItemWithSelector(spaceXPos, rowY, "_____", spaceSelected);
-      currentX += spaceXWidth;
+      // Space bar (logical cols 2-5)
+      const bool spaceSelected =
+          (selectedRow == SPECIAL_ROW && selectedCol >= SPACE_COL && selectedCol < BACKSPACE_COL);
+      const int spaceWidth = BACKSPACE_COL - SPACE_COL;
+      const int spaceXWidth = unitX(SPACE_COL + spaceWidth) - unitX(SPACE_COL);
+      drawKey(Rect{currentX, rowY, spaceXWidth, keyHeight}, "____", spaceSelected);
+      currentX = unitX(BACKSPACE_COL);
 
-      // Backspace key (logical col 7, spans 2 key widths)
-      const bool bsSelected = (selectedRow == 5 && selectedCol >= BACKSPACE_COL && selectedCol < DONE_COL);
-      renderItemWithSelector(currentX + 2, rowY, "<-", bsSelected);
-      currentX += 2 * (keyWidth + keySpacing);
+      // Backspace key (logical cols 6-7)
+      const bool bsSelected = (selectedRow == SPECIAL_ROW && selectedCol >= BACKSPACE_COL && selectedCol < DONE_COL);
+      const int backspaceWidth = DONE_COL - BACKSPACE_COL;
+      const int backspaceXWidth = unitX(BACKSPACE_COL + backspaceWidth) - unitX(BACKSPACE_COL);
+      drawKey(Rect{currentX, rowY, backspaceXWidth, keyHeight}, "<-", bsSelected);
+      currentX = unitX(DONE_COL);
 
-      // OK button (logical col 9, spans 2 key widths)
-      const bool okSelected = (selectedRow == 5 && selectedCol >= DONE_COL);
-      renderItemWithSelector(currentX + 2, rowY, "OK", okSelected);
+      // OK button (logical cols 8-9)
+      const bool okSelected = (selectedRow == SPECIAL_ROW && selectedCol >= DONE_COL);
+      const int okWidth = getRowLength(row) - DONE_COL;
+      const int okXWidth = unitX(DONE_COL + okWidth) - unitX(DONE_COL);
+      drawKey(Rect{currentX, rowY, okXWidth, keyHeight}, "OK", okSelected);
     } else {
       // Regular rows: render each key individually
       for (int col = 0; col < getRowLength(row); col++) {
-        // Get the character to display
         const char c = layout[row][col];
         std::string keyLabel(1, c);
-        const int charWidth = renderer.getTextWidth(UI_10_FONT_ID, keyLabel.c_str());
-
-        const int keyX = startX + col * (keyWidth + keySpacing) + (keyWidth - charWidth) / 2;
+        const int keyX = unitX(col);
+        const int keyW = unitX(col + 1) - keyX;
         const bool isSelected = row == selectedRow && col == selectedCol;
-        renderItemWithSelector(keyX, rowY, keyLabel.c_str(), isSelected);
+        drawKey(Rect{keyX, rowY, keyW, keyHeight}, keyLabel.c_str(), isSelected);
       }
     }
   }
-
 
   // Draw help text
   const auto labels = mappedInput.mapLabels("« Back", "Select", "Left", "Right");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
-  // Draw side button hints for Up/Down navigation
-  GUI.drawSideButtonHints(renderer, "Up", "Down");
-
   renderer.displayBuffer();
-}
-
-
-
-void KeyboardEntryActivity::renderItemWithSelector(const int x, const int y, const char* item,
-                                                   const bool isSelected) const {
-  if (isSelected) {
-    const int itemWidth = renderer.getTextWidth(UI_10_FONT_ID, item);
-    renderer.drawText(UI_10_FONT_ID, x - 6, y, "[");
-    renderer.drawText(UI_10_FONT_ID, x + itemWidth, y, "]");
-  }
-  renderer.drawText(UI_10_FONT_ID, x, y, item);
 }
 
 // visibility helpers

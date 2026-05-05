@@ -21,6 +21,71 @@
 //清理字体内存
 #include "CustomEpdFont.h"
 
+namespace {
+int clampPercent(const int percent) {
+  if (percent < 0) {
+    return 0;
+  }
+  if (percent > 100) {
+    return 100;
+  }
+  return percent;
+}
+
+bool tryReadEpubBookProgressPercent(const std::string& bookPath, int& outPercent) {
+  if (!StringUtils::checkFileExtension(bookPath, ".epub")) {
+    return false;
+  }
+
+  Epub epub(bookPath, "/.crosspoint");
+  if (!epub.load(false, true)) {
+    return false;
+  }
+
+  const int spineCount = epub.getSpineItemsCount();
+  if (spineCount <= 0) {
+    return false;
+  }
+
+  FsFile progressFile;
+  if (!SdMan.openFileForRead("HPR", epub.getCachePath() + "/progress.bin", progressFile)) {
+    return false;
+  }
+
+  uint8_t data[6] = {0};
+  const int dataSize = progressFile.read(data, sizeof(data));
+  progressFile.close();
+  if (dataSize != 4 && dataSize != 6) {
+    return false;
+  }
+
+  const int currentSpineIndex = data[0] + (data[1] << 8);
+  if (currentSpineIndex < 0 || currentSpineIndex >= spineCount) {
+    return false;
+  }
+
+  const int currentPage = data[2] + (data[3] << 8);
+  int pageCount = 0;
+  if (dataSize == 6) {
+    pageCount = data[4] + (data[5] << 8);
+  }
+
+  float chapterProgress = 0.0f;
+  if (pageCount > 0) {
+    chapterProgress = static_cast<float>(currentPage) / static_cast<float>(pageCount);
+    if (chapterProgress < 0.0f) {
+      chapterProgress = 0.0f;
+    } else if (chapterProgress > 1.0f) {
+      chapterProgress = 1.0f;
+    }
+  }
+
+  const float bookProgress = epub.calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
+  outPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
+  return true;
+}
+}  // namespace
+
 void HomeActivity::taskTrampoline(void* param) {
   auto* self = static_cast<HomeActivity*>(param);
   self->displayTaskLoop();
@@ -57,6 +122,11 @@ void HomeActivity::loadRecentBooks(int maxBooks) {
     }
 
     recentBooks.push_back(book);
+    recentBooks.back().progressPercent = -1;
+    int progressPercent = 0;
+    if (tryReadEpubBookProgressPercent(recentBooks.back().path, progressPercent)) {
+      recentBooks.back().progressPercent = progressPercent;
+    }
   }
 }
 
@@ -275,25 +345,31 @@ void HomeActivity::render() {
 
   // Build menu items dynamically
 std::vector<const char*> menuItems = {"挑选一本书", "最近阅读"};
+std::vector<UIIcon> menuIcons = {Folder, Recent};
 
 if (hasOpdsUrl) {
     menuItems.push_back("OPDS 浏览器");
+    menuIcons.push_back(Cloudy);
 }
 if (hasjianguoUrl) {
     menuItems.push_back("坚果云");
+  menuIcons.push_back(Cloudy);
 }
 
 
 menuItems.push_back("wifi功能");
+menuIcons.push_back(Wifi);
 menuItems.push_back("设置");
+menuIcons.push_back(Settings);
 
   GUI.drawButtonMenu(
       renderer,
-      Rect{0, metrics.homeTopPadding + metrics.homeCoverTileHeight + metrics.verticalSpacing, pageWidth,
+      Rect{5, metrics.homeTopPadding + metrics.homeCoverTileHeight + metrics.verticalSpacing, pageWidth,
            pageHeight - (metrics.headerHeight + metrics.homeTopPadding + metrics.verticalSpacing * 2 +
                          metrics.buttonHintsHeight)},
       static_cast<int>(menuItems.size()), selectorIndex - recentBooks.size(),
-      [&menuItems](int index) { return std::string(menuItems[index]); }, nullptr);
+      [&menuItems](int index) { return std::string(menuItems[index]); },
+      [&menuIcons](int index) { return menuIcons[index]; });
 
   const auto labels = mappedInput.mapLabels("", "选择", "向上", "向下");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);

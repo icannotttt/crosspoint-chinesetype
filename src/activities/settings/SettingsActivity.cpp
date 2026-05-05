@@ -60,7 +60,6 @@ void SettingsActivity::onEnter() {
 
   // Append device-only ACTION items
   controlsSettings.insert(controlsSettings.begin(), SettingInfo::Action("Remap Front Buttons"));
-  //systemSettings.push_back(SettingInfo::Action("bluetooth"));
   systemSettings.push_back(SettingInfo::Action("KOReader Sync"));
   systemSettings.push_back(SettingInfo::Action("OPDS Browser"));
   systemSettings.push_back(SettingInfo::Action("坚果云信息配置"));

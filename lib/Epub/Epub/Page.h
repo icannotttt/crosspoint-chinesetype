@@ -48,6 +48,8 @@ class PageImage final : public PageElement {
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) override;
   bool serialize(FsFile& file) override;
   PageElementTag getTag() const override { return TAG_PageImage; }
+  int16_t getWidth() const { return imageBlock ? imageBlock->getWidth() : 0; }
+  int16_t getHeight() const { return imageBlock ? imageBlock->getHeight() : 0; }
   static std::unique_ptr<PageImage> deserialize(FsFile& file);
 };
 
@@ -62,5 +64,6 @@ class Page {
   return std::any_of(elements.begin(), elements.end(),
                       [](const std::shared_ptr<PageElement>& el) { return el->getTag() == TAG_PageImage; });
 }
+  bool getImageBoundingBox(int16_t& outX, int16_t& outY, int16_t& outW, int16_t& outH) const;
 //void renderPngSleepScreen(GfxRenderer& renderer) const;
 };

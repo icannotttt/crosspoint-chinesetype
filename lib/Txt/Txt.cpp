@@ -4,6 +4,14 @@
 #include <JpegToBmpConverter.h>
 #include <Serialization.h>
 
+namespace {
+constexpr int CHAPTER_BATCH_SIZE = 15;
+constexpr int CHAPTER_CACHE_SPAN = CHAPTER_BATCH_SIZE + 1;
+constexpr int CHAPTER_CACHE_LAST_OFFSET = CHAPTER_CACHE_SPAN - 1;
+constexpr uint32_t TYPE_CACHE_MAGIC = 0x54595045; // "TYPE"
+constexpr uint32_t TYPE_CACHE_VERSION = 1;
+}
+
 Txt::Txt(std::string path, std::string cacheBasePath)
     : filepath(std::move(path)), cacheBasePath(std::move(cacheBasePath)) {
   // Generate cache path from file path hash
@@ -103,6 +111,18 @@ std::string Txt::findCoverImage() const {
 }
 
 std::string Txt::getCoverBmpPath() const { return cachePath + "/cover.bmp"; }
+
+std::string Txt::getChapterCacheFilePath(int startChapter) const {
+    char cacheFile[128] = {0};
+    if (m_isVolumeOnlyBook) {
+        snprintf(cacheFile, sizeof(cacheFile), "%s/sentence_chapters_%d_%d.bin", getCachePath().c_str(), startChapter,
+                 CHAPTER_BATCH_SIZE);
+    } else {
+        snprintf(cacheFile, sizeof(cacheFile), "%s/chapters_%d_%d.bin", getCachePath().c_str(), startChapter,
+                 CHAPTER_BATCH_SIZE);
+    }
+    return cacheFile;
+}
 
 bool Txt::generateCoverBmp() const {
   // Already generated, return true
@@ -204,32 +224,22 @@ bool Txt::readContent(uint8_t* buffer, size_t offset, size_t length) const {
 
 //加目录
 void Txt::parseChapterIndexAndOffset(int n) {
+    const unsigned long parseStartMs = millis();
     char readBuffer[128] = {0};
     int bufferLen = 0;
     constexpr bool VERBOSE_CHAPTER_PARSE_LOG = false;
 
     // 配置参数（保持不变）
-    const int CHAPTER_START = n;
-    const int CHAPTER_END = n + 24;
+    const int CHAPTER_START = n / CHAPTER_BATCH_SIZE * CHAPTER_BATCH_SIZE;
+    const int CHAPTER_END = CHAPTER_START + CHAPTER_CACHE_LAST_OFFSET;
     const uint32_t VOLUME_PAGE_SIZE = 2880;
-    const char* VOLUME_TITLE_PREFIX = "分卷阅读";
     const uint64_t CHAPTER_CHECK_THRESHOLD = VOLUME_PAGE_SIZE;
-    const int MAX_BACK_SEARCH_LEN = 1024;
-    const size_t BACK_SCAN_CHUNK_SIZE = 1024;
-    // 向后探测的最大范围：覆盖下一批起始，避免无限扫描
     const uint64_t MAX_NEXT_SEARCH = 2 * VOLUME_PAGE_SIZE;
 
     uint64_t chapterScanStartOffset = 0;
     int chapterScanStartIndex = 0;
 
     Serial.printf("[ChapterRange] ✅ 本次加载范围：%d ~ %d\n", CHAPTER_START, CHAPTER_END);
-
-    // ========== 1. 优先读缓存（保持） ==========
-    bool loadSuccess = loadChapterFromTxt(n);
-    if (loadSuccess) {
-        Serial.printf("[ChapterLoader] ✅ 缓存命中，直接返回\n");
-        return;
-    }
 
     // ========== 2. 初始化 + 获取文件总大小（保持） ==========
     chapterActualCount = 0;
@@ -244,8 +254,34 @@ void Txt::parseChapterIndexAndOffset(int n) {
         return;
     }
 
-    // ========== 3. 分卷/章节模式检测（保持） ==========
-    if (!m_isVolumeOnlyBook) {
+    // ========== 3. 分卷/章节模式检测（优先读取type缓存） ==========
+    bool typeCacheLoaded = false;
+    setupCacheDir();
+    const std::string typeCachePath = getCachePath() + "/type.bin";
+
+    {
+        FsFile typeFile;
+        if (SdMan.openFileForRead("TXT", typeCachePath, typeFile)) {
+            uint32_t magic = 0;
+            uint32_t version = 0;
+            uint8_t mode = 0;
+            serialization::readPod(typeFile, magic);
+            serialization::readPod(typeFile, version);
+            serialization::readPod(typeFile, mode);
+            typeFile.close();
+
+            if (magic == TYPE_CACHE_MAGIC && version == TYPE_CACHE_VERSION && (mode == 0 || mode == 1)) {
+                m_isVolumeOnlyBook = (mode == 1);
+                typeCacheLoaded = true;
+                Serial.printf("[%lu] [TXT] Loaded type cache: %s (%s)\n", millis(), typeCachePath.c_str(),
+                              m_isVolumeOnlyBook ? "volume-only" : "chapter");
+            } else {
+                Serial.printf("[%lu] [TXT] Type cache invalid, will rescan: %s\n", millis(), typeCachePath.c_str());
+            }
+        }
+    }
+
+    if (!typeCacheLoaded) {
         FsFile checkFile;
         bool hasValidChapter = false;
         int chapterFoundCount = 0;
@@ -304,20 +340,48 @@ void Txt::parseChapterIndexAndOffset(int n) {
             m_isVolumeOnlyBook = true;
         } else {
             Serial.printf("[ChapterMode] ✅ 检测到有效章节，走原章节解析逻辑\n");
+            m_isVolumeOnlyBook = false;
+        }
+
+        FsFile typeFile;
+        if (SdMan.openFileForWrite("TXT", typeCachePath, typeFile)) {
+            serialization::writePod(typeFile, TYPE_CACHE_MAGIC);
+            serialization::writePod(typeFile, TYPE_CACHE_VERSION);
+            const uint8_t mode = m_isVolumeOnlyBook ? 1 : 0;
+            serialization::writePod(typeFile, mode);
+            typeFile.sync();
+            typeFile.close();
+            Serial.printf("[%lu] [TXT] Saved type cache: %s (%s)\n", millis(), typeCachePath.c_str(),
+                          m_isVolumeOnlyBook ? "volume-only" : "chapter");
+        } else {
+            Serial.printf("[%lu] [TXT] Failed to save type cache: %s\n", millis(), typeCachePath.c_str());
         }
     }
 
+    // ========== 4. 优先读缓存（保持） ==========
+    bool loadSuccess = loadChapterFromTxt(CHAPTER_START);
+    if (loadSuccess) {
+        Serial.printf("[ChapterLoader] ✅ 缓存命中，直接返回\n");
+        return;
+    }
+
     // ========== 3.5 章节模式扫描起点优化：尝试复用上一批缓存 ==========
-    if (!m_isVolumeOnlyBook && CHAPTER_START >= 25) {
+    if (CHAPTER_START >= CHAPTER_BATCH_SIZE) {
         bool hasChapterHint = false;
-        const int prevBatchStart = CHAPTER_START - 25;
+        const int prevBatchStart = CHAPTER_START - CHAPTER_BATCH_SIZE;
         if (loadChapterFromTxt(prevBatchStart) && chapterActualCount > 0) {
-            const int safeCount = (chapterActualCount > 25) ? 25 : chapterActualCount;
+            const int safeCount = (chapterActualCount > CHAPTER_CACHE_SPAN) ? CHAPTER_CACHE_SPAN : chapterActualCount;
             const int last = safeCount - 1;
-            const uint64_t hintOffset = chapterDataList[last].endOffset;
-            const uint64_t hintStart = chapterDataList[last].byteOffset;
-            const int hintIndex = chapterDataList[last].chapterIndex + 1;
-            if (hintOffset > hintStart && hintOffset < fileSize && hintIndex <= CHAPTER_START) {
+
+            // 优先用“边界章”起点做下一批起扫，回退再用上一章的endOffset。
+            uint64_t hintOffset = chapterDataList[last].byteOffset;
+            int hintIndex = chapterDataList[last].chapterIndex;
+            if (hintIndex < CHAPTER_START || hintOffset >= fileSize) {
+                hintOffset = chapterDataList[last].endOffset;
+                hintIndex = chapterDataList[last].chapterIndex + 1;
+            }
+
+            if (hintOffset < fileSize && hintIndex <= CHAPTER_START) {
                 chapterScanStartOffset = hintOffset;
                 chapterScanStartIndex = hintIndex;
                 hasChapterHint = true;
@@ -339,7 +403,7 @@ void Txt::parseChapterIndexAndOffset(int n) {
         memset(chapterDataList, 0, sizeof(chapterDataList));
     }
 
-    // ========== 4. 纯分卷模式（核心修改：向后探测下一分卷） ==========
+    // ========== 5. 纯分卷模式 ==========
     if (m_isVolumeOnlyBook) {
         FsFile file;
         if (!file.open(filepath.c_str(), FILE_READ)) {
@@ -347,165 +411,98 @@ void Txt::parseChapterIndexAndOffset(int n) {
             goto save_and_exit;
         }
 
-        auto findLineStartBeforeOffset = [&](uint64_t theoryOffset, uint64_t& actualOffset) -> bool {
-            if (theoryOffset == 0) {
-                actualOffset = 0;
-                return true;
-            }
+        const int PARAGRAPHS_PER_CHAPTER = 20 +random(5); // 增加随机性
+        const size_t VOLUME_SCAN_CHUNK_SIZE = 1024;
 
-            char chunk[BACK_SCAN_CHUNK_SIZE];
+        int chapterIndex = chapterScanStartIndex;
+        int currSaveCount = 0;
+        int paragraphCount = 0;
+        bool lineHasContent = false;
+        uint64_t chapterStartOffset = chapterScanStartOffset;
+        uint64_t currentReadOffset = chapterScanStartOffset;
+        char chunk[VOLUME_SCAN_CHUNK_SIZE];
 
-            uint64_t backSearchStart =
-                (theoryOffset >= static_cast<uint64_t>(MAX_BACK_SEARCH_LEN)) ? (theoryOffset - MAX_BACK_SEARCH_LEN) : 0;
-            uint64_t scanPos = theoryOffset;
-
-            while (scanPos > backSearchStart) {
-                uint64_t chunkStart = (scanPos >= BACK_SCAN_CHUNK_SIZE) ? (scanPos - BACK_SCAN_CHUNK_SIZE) : 0;
-                if (chunkStart < backSearchStart) {
-                    chunkStart = backSearchStart;
-                }
-
-                const size_t bytesToRead = static_cast<size_t>(scanPos - chunkStart);
-                if (bytesToRead == 0) {
-                    break;
-                }
-
-                if (!file.seek(chunkStart)) {
-                    return false;
-                }
-
-                const int bytesRead = file.read(chunk, bytesToRead);
-                if (bytesRead <= 0) {
-                    return false;
-                }
-
-                for (int i = bytesRead - 1; i >= 0; --i) {
-                    if (chunk[i] == '\n') {
-                        actualOffset = chunkStart + static_cast<uint64_t>(i) + 1;
-                        return true;
-                    }
-                }
-
-                scanPos = chunkStart;
-            }
-
-            actualOffset = theoryOffset;
-            return false;
-        };
-
-        auto findLineStartAfterOffset = [&](uint64_t theoryOffset, uint64_t& actualOffset) -> bool {
-            if (theoryOffset >= fileSize) {
-                actualOffset = fileSize;
-                return false;
-            }
-
-            char chunk[BACK_SCAN_CHUNK_SIZE];
-            uint64_t scanPos = theoryOffset;
-            uint64_t searchEnd = theoryOffset + MAX_NEXT_SEARCH;
-            if (searchEnd > fileSize) {
-                searchEnd = fileSize;
-            }
-
-            while (scanPos < searchEnd) {
-                const uint64_t remain = searchEnd - scanPos;
-                const size_t bytesToRead = (remain > BACK_SCAN_CHUNK_SIZE) ? BACK_SCAN_CHUNK_SIZE : static_cast<size_t>(remain);
-                if (bytesToRead == 0) {
-                    break;
-                }
-
-                if (!file.seek(scanPos)) {
-                    return false;
-                }
-
-                const int bytesRead = file.read(chunk, bytesToRead);
-                if (bytesRead <= 0) {
-                    return false;
-                }
-
-                for (int i = 0; i < bytesRead; ++i) {
-                    if (chunk[i] == '\n') {
-                        actualOffset = scanPos + static_cast<uint64_t>(i) + 1;
-                        return true;
-                    }
-                }
-
-                scanPos += static_cast<uint64_t>(bytesRead);
-            }
-
-            actualOffset = fileSize;
-            return false;
-        };
-
-        int volCount = 0;
-        uint64_t volOffsets[25] = {0}; // 存储当前批次偏移
-        int volIndexes[25] = {0};      // 存储当前批次分卷号
-
-        // 步骤1：解析当前批次25个分卷（保持）
-        for (int i = 0; i < 25; ++i) {
-            int volIdx = CHAPTER_START + i;
-            uint64_t theoryOffset = (uint64_t)volIdx * VOLUME_PAGE_SIZE;
-            uint64_t actualOffset = theoryOffset;
-
-            if (volIdx > 0 && theoryOffset < fileSize) {
-                bool foundNewLine = findLineStartBeforeOffset(theoryOffset, actualOffset);
-                if (VERBOSE_CHAPTER_PARSE_LOG) {
-                    if (foundNewLine) {
-                        Serial.printf("[Volume] ✅ 分卷%d 找到\\n，理论%llu → 实际%llu\n", volIdx,
-                                      (unsigned long long)theoryOffset, (unsigned long long)actualOffset);
-                    } else {
-                        Serial.printf("[Volume] ⚠️ 分卷%d 未找到\\n，使用理论%llu\n", volIdx,
-                                      (unsigned long long)theoryOffset);
-                    }
-                } else {
-                    (void)foundNewLine;
-                }
-            }
-
-            if (actualOffset >= fileSize) {
-                if (volCount == 0) break;
-                else continue;
-            }
-
-            volOffsets[volCount] = actualOffset;
-            volIndexes[volCount] = volIdx;
-            chapterDataList[volCount].chapterIndex = volIdx;
-            chapterDataList[volCount].byteOffset = actualOffset;
-            snprintf(chapterDataList[volCount].shortTitle, TITLE_BUF_SIZE - 1, "%s%d", VOLUME_TITLE_PREFIX, volIdx + 1);
-            chapterDataList[volCount].shortTitle[TITLE_BUF_SIZE - 1] = '\0';
-
-            if (VERBOSE_CHAPTER_PARSE_LOG) {
-                Serial.printf("[Volume] ✅ 分卷%d 已生成，实际偏移%llu\n", volIdx, (unsigned long long)actualOffset);
-            }
-            volCount++;
+        if (chapterScanStartOffset > 0 && !file.seek(chapterScanStartOffset)) {
+            Serial.printf("[VolumeHint] ⚠️ 起扫偏移定位失败，回退文件头\n");
+            chapterIndex = 0;
+            currSaveCount = 0;
+            paragraphCount = 0;
+            lineHasContent = false;
+            chapterStartOffset = 0;
+            currentReadOffset = 0;
+            file.seek(0);
         }
 
-        // 步骤2：为每个分卷计算endOffset（严格只向后探测，防止缺字）
-        for (int i = 0; i < volCount; i++) {
-            const int nextVolIdx = volIndexes[i] + 1;
-            const uint64_t nextTheoryOffset = (uint64_t)nextVolIdx * VOLUME_PAGE_SIZE;
-            uint64_t nextActualOffset = fileSize;
-            bool hasNextVol = false;
-
-            // endOffset 只允许向后找行首，不向前回退
-            if (nextTheoryOffset < fileSize) {
-                hasNextVol = findLineStartAfterOffset(nextTheoryOffset, nextActualOffset) &&
-                             nextActualOffset > chapterDataList[i].byteOffset && nextActualOffset <= fileSize;
+        auto storeVolumeChapter = [&](int index, uint64_t startOffset) {
+            if (index < CHAPTER_START || index > CHAPTER_END || currSaveCount >= CHAPTER_CACHE_SPAN) {
+                return;
             }
 
-            chapterDataList[i].endOffset = hasNextVol ? nextActualOffset : fileSize;
+            chapterDataList[currSaveCount].chapterIndex = index;
+            chapterDataList[currSaveCount].byteOffset = startOffset;
+            chapterDataList[currSaveCount].endOffset = fileSize;
+            snprintf(chapterDataList[currSaveCount].shortTitle, TITLE_BUF_SIZE - 1, "第%d章", index + 1);
+            chapterDataList[currSaveCount].shortTitle[TITLE_BUF_SIZE - 1] = '\0';
+            currSaveCount++;
+
             if (VERBOSE_CHAPTER_PARSE_LOG) {
-                Serial.printf("[Volume] ✅ 分卷%d endOffset：%llu（%s）\n", volIndexes[i],
-                              (unsigned long long)chapterDataList[i].endOffset,
-                              hasNextVol ? "向后探测" : "文件末尾");
+                Serial.printf("[Volume] ✅ 虚拟章节%d 已生成，起始偏移%llu\n", index, (unsigned long long)startOffset);
+            }
+        };
+
+        storeVolumeChapter(chapterIndex, chapterStartOffset);
+
+        while (file.available()) {
+            const size_t bytesToRead = (file.available() > static_cast<int>(VOLUME_SCAN_CHUNK_SIZE))
+                                           ? VOLUME_SCAN_CHUNK_SIZE
+                                           : static_cast<size_t>(file.available());
+            const int bytesRead = file.read(chunk, bytesToRead);
+            if (bytesRead <= 0) {
+                break;
+            }
+
+            for (int i = 0; i < bytesRead; ++i) {
+                const uint8_t currentByte = static_cast<uint8_t>(chunk[i]);
+                currentReadOffset++;
+
+                if (currentByte == '\n') {
+                    if (lineHasContent) {
+                        paragraphCount++;
+                        lineHasContent = false;
+                    }
+
+                    if (paragraphCount >= PARAGRAPHS_PER_CHAPTER) {
+                        const uint64_t chapterEndOffset = currentReadOffset;
+                        if (currSaveCount > 0) {
+                            chapterDataList[currSaveCount - 1].endOffset = chapterEndOffset;
+                        }
+
+                        if (chapterEndOffset >= fileSize) {
+                            goto volume_parse_done;
+                        }
+
+                        chapterIndex++;
+                        chapterStartOffset = chapterEndOffset;
+                        paragraphCount = 0;
+                        storeVolumeChapter(chapterIndex, chapterStartOffset);
+
+                        if (currSaveCount > 0 && chapterIndex > CHAPTER_END) {
+                            goto volume_parse_done;
+                        }
+                    }
+                } else if (currentByte != '\r' && currentByte != ' ' && currentByte != '\t') {
+                    lineHasContent = true;
+                }
             }
         }
 
+volume_parse_done:
         file.close();
-        chapterActualCount = volCount;
+        chapterActualCount = currSaveCount;
         goto save_and_exit;
     }
 
-    // ========== 5. 有章节模式（核心修改：向后探测下一章节） ==========
+    // ========== 6. 有章节模式（核心修改：向后探测下一章节） ==========
     {
         FsFile file;
         if (!file.open(filepath.c_str(), FILE_READ)) {
@@ -519,8 +516,8 @@ void Txt::parseChapterIndexAndOffset(int n) {
         int currSaveCount = 0;
         bool skipBom = true;
         uint64_t currentReadOffset = chapterScanStartOffset;
-        uint64_t chapOffsets[25] = {0}; // 当前批次章节偏移
-        int chapIndexes[25] = {0};      // 当前批次章节号
+        uint64_t chapOffsets[CHAPTER_CACHE_SPAN] = {0}; // 当前批次章节偏移
+        int chapIndexes[CHAPTER_CACHE_SPAN] = {0};      // 当前批次章节号
 
         if (chapterScanStartOffset > 0 && !file.seek(chapterScanStartOffset)) {
             Serial.printf("[ChapterHint] ⚠️ 起扫偏移定位失败，回退文件头\n");
@@ -557,8 +554,8 @@ void Txt::parseChapterIndexAndOffset(int n) {
             dst[TITLE_BUF_SIZE - 1] = '\0';
         };
 
-        // 步骤1：解析当前批次25个章节（保持）
-        while (file.available() && currSaveCount < 25) {
+        // 步骤1：解析当前批次章节（保持）
+        while (file.available() && currSaveCount < CHAPTER_CACHE_SPAN) {
             bufferLen = 0;
             memset(readBuffer, 0, sizeof(readBuffer));
 
@@ -670,32 +667,35 @@ save_and_exit:
     } else {
         Serial.printf("[Result] ⚠️ 本次无有效条目\n");
     }
-    saveChapterToTxt(n);
+    saveChapterToTxt(CHAPTER_START);
+    Serial.printf("[ChapterTime] chapterStart=%d mode=%s total=%lums\n", CHAPTER_START,
+                  m_isVolumeOnlyBook ? "sentence" : "chapter",
+                  millis() - parseStartMs);
     memset(readBuffer, 0, sizeof(readBuffer));
 }
 
 
-// 保存25章到单个TXT（纯C风格，无String）
+// 保存章节批次到单个TXT（纯C风格，无String）
 // 先确保必要的宏/类型定义（如果未定义）
 #ifndef CACHE_MAGIC
 #define CACHE_MAGIC 0x43484150  // "CHAP" ASCII码，自定义魔数
 #endif
 
 #ifndef CACHE_VERSION
-#define CACHE_VERSION 1          // 缓存版本号
+#define CACHE_VERSION 2          // 缓存版本号（批次规则变更后提升）
 #endif
 
-// 保存25章到单个BIN文件（使用serialization::writePod/writeString规范）
+// 保存章节批次到单个BIN文件（使用serialization::writePod/writeString规范）
 void Txt::saveChapterToTxt(int startChapter) {
     FsFile f;
     char savePath[128] = {0};
-    // 文件名格式：chapters_起始章n_25.bin
-    snprintf(savePath, sizeof(savePath), "%s/chapters_%d_25.bin", getCachePath().c_str(), startChapter);
+    const std::string cacheFilePath = getChapterCacheFilePath(startChapter);
+    snprintf(savePath, sizeof(savePath), "%s", cacheFilePath.c_str());
 
     // 打开文件（失败则直接返回并打印日志）
     if (!SdMan.openFileForWrite("TRA", savePath, f)) {
         Serial.printf("[ChapterSaver] ❌ %d~%d章合并保存失败 → %s\n", 
-                      startChapter, startChapter+24, savePath);
+                      startChapter, startChapter + CHAPTER_CACHE_LAST_OFFSET, savePath);
         return;
     }
 
@@ -706,7 +706,7 @@ void Txt::saveChapterToTxt(int startChapter) {
     serialization::writePod(f, static_cast<uint32_t>(chapterActualCount));  // 实际保存章节数
 
     // ========== 2. 写入章节数据主体（使用writeString存储标题） ==========
-    for (int i = 0; i < chapterActualCount && i < 25; i++) {
+    for (int i = 0; i < chapterActualCount && i < CHAPTER_CACHE_SPAN; i++) {
         // 1. 章节序号（int → int32_t 保证长度统一）
         serialization::writePod(f, static_cast<int32_t>(chapterDataList[i].chapterIndex));
         // 2. 字节偏移量（uint32_t 直接写入）
@@ -723,10 +723,11 @@ void Txt::saveChapterToTxt(int startChapter) {
     f.close();
 
     Serial.printf("[ChapterSaver] ✅ %d~%d章合并保存成功 → %s | 实际保存%d章 | 魔数：0x%X 版本：%d\n", 
-                  startChapter, startChapter+24, savePath, chapterActualCount, CACHE_MAGIC, CACHE_VERSION);
+                  startChapter, startChapter + CHAPTER_CACHE_LAST_OFFSET, savePath,
+                  chapterActualCount, CACHE_MAGIC, CACHE_VERSION);
 }
 
-// 加载25章从单个TXT（纯C风格，无String）
+// 加载章节批次从单个TXT（纯C风格，无String）
 bool Txt::loadChapterFromTxt(int startChapter) {
     // ========== 1. 初始化/清理数据（保留原loadChapterFromTxt的清理逻辑） ==========
     chapterActualCount = 0;
@@ -735,11 +736,13 @@ bool Txt::loadChapterFromTxt(int startChapter) {
 
     FsFile f;
     char loadPath[128] = {0};
-    snprintf(loadPath, sizeof(loadPath), "%s/chapters_%d_25.bin", getCachePath().c_str(), startChapter);
+    const std::string cacheFilePath = getChapterCacheFilePath(startChapter);
+    snprintf(loadPath, sizeof(loadPath), "%s", cacheFilePath.c_str());
 
     // 打开文件失败（对齐参考示例的日志风格）
     if (!SdMan.openFileForRead("TRA", loadPath, f)) {
-        Serial.printf("[%lu] [TRA] No chapter cache found for %d~%d → %s\n", millis(), startChapter, startChapter+24, loadPath);
+        Serial.printf("[%lu] [%s] No chapter cache found for %d~%d → %s\n", millis(), m_isVolumeOnlyBook ? "VOL" : "TRA",
+                      startChapter, startChapter + CHAPTER_CACHE_LAST_OFFSET, loadPath);
         return false;
     }
 
@@ -748,8 +751,8 @@ bool Txt::loadChapterFromTxt(int startChapter) {
     uint32_t magic;
     serialization::readPod(f, magic);
     if (magic != CACHE_MAGIC) {
-        Serial.printf("[%lu] [TRA] Chapter cache magic mismatch (0x%X != 0x%X), rebuilding\n", 
-                      millis(), magic, CACHE_MAGIC);
+        Serial.printf("[%lu] [%s] Chapter cache magic mismatch (0x%X != 0x%X), rebuilding\n", 
+                      millis(), m_isVolumeOnlyBook ? "VOL" : "TRA", magic, CACHE_MAGIC);
         f.close();
         return false;
     }
@@ -758,8 +761,8 @@ bool Txt::loadChapterFromTxt(int startChapter) {
     uint32_t version; // 对齐参考示例用uint32_t，若原版本是uint8_t可调整
     serialization::readPod(f, version);
     if (version != CACHE_VERSION) {
-        Serial.printf("[%lu] [TRA] Chapter cache version mismatch (%d != %d), rebuilding\n", 
-                      millis(), version, CACHE_VERSION);
+        Serial.printf("[%lu] [%s] Chapter cache version mismatch (%d != %d), rebuilding\n", 
+                      millis(), m_isVolumeOnlyBook ? "VOL" : "TRA", version, CACHE_VERSION);
         f.close();
         return false;
     }
@@ -768,8 +771,8 @@ bool Txt::loadChapterFromTxt(int startChapter) {
     uint32_t cacheStartChapter;
     serialization::readPod(f, cacheStartChapter);
     if (cacheStartChapter != static_cast<uint32_t>(startChapter)) {
-        Serial.printf("[%lu] [TRA] Chapter cache start mismatch (%d != %d), rebuilding\n", 
-                      millis(), cacheStartChapter, startChapter);
+        Serial.printf("[%lu] [%s] Chapter cache start mismatch (%d != %d), rebuilding\n", 
+                      millis(), m_isVolumeOnlyBook ? "VOL" : "TRA", cacheStartChapter, startChapter);
         f.close();
         return false;
     }
@@ -777,16 +780,17 @@ bool Txt::loadChapterFromTxt(int startChapter) {
     // 2.4 读取缓存的章节总数
     uint32_t cacheChapterCount;
     serialization::readPod(f, cacheChapterCount);
-    if (cacheChapterCount > 25) { // 最多只存25章，超出则无效
-        Serial.printf("[%lu] [TRA] Chapter cache count invalid (%d > 25), rebuilding\n", 
-                      millis(), cacheChapterCount);
+    if (cacheChapterCount > CHAPTER_CACHE_SPAN) { // 最多只存一个批次（含边界章），超出则无效
+        Serial.printf("[%lu] [%s] Chapter cache count invalid (%d > %d), rebuilding\n", 
+                  millis(), m_isVolumeOnlyBook ? "VOL" : "TRA", cacheChapterCount,
+                  CHAPTER_CACHE_SPAN);
         f.close();
         return false;
     }
 
     // ========== 3. 读取章节数据主体（逐字段+验证） ==========
      int chapterNum = 0;
-    while (chapterNum < 25 && chapterNum < cacheChapterCount && f.available()) {
+    while (chapterNum < CHAPTER_CACHE_SPAN && chapterNum < cacheChapterCount && f.available()) {
         // 3.1 读取章节序号
         int32_t actualChap;
         serialization::readPod(f, actualChap);
@@ -825,8 +829,10 @@ bool Txt::loadChapterFromTxt(int startChapter) {
 
     // 日志输出（融合参考示例+业务逻辑）
     if (loadOk) {
-        Serial.printf("[%lu] [TRA] Loaded chapter cache: %d~%d → %s | %d chapters\n", 
-                      millis(), startChapter, startChapter+24, loadPath, chapterActualCount);
+        Serial.printf("[%lu] [%s] Loaded chapter cache: %d~%d → %s | %d chapters\n", 
+                      millis(), m_isVolumeOnlyBook ? "VOL" : "TRA", startChapter,
+                      startChapter + CHAPTER_CACHE_LAST_OFFSET, loadPath,
+                      chapterActualCount);
     }
 
     return loadOk;

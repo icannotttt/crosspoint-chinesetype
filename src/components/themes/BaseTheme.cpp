@@ -11,6 +11,7 @@
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/StringUtils.h"
 
 // Internal constants
 namespace {
@@ -160,7 +161,7 @@ void BaseTheme::drawSideButtonHints(const GfxRenderer& renderer, const char* top
 void BaseTheme::drawList(const GfxRenderer& renderer, Rect rect, int itemCount, int selectedIndex,
                          const std::function<std::string(int index)>& rowTitle,
                          const std::function<std::string(int index)>& rowSubtitle,
-                         const std::function<std::string(int index)>& rowIcon,
+                         const std::function<UIIcon(int index)>& rowIcon,
                          const std::function<std::string(int index)>& rowValue) const {
   int rowHeight =
       (rowSubtitle != nullptr) ? BaseMetrics::values.listWithSubtitleRowHeight : BaseMetrics::values.listRowHeight;
@@ -302,7 +303,8 @@ void BaseTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const std:
     // Draw cover image as background if available (inside the box)
     // Only load from SD on first render, then use stored buffer
 
-    if (hasContinueReading && !recentBooks[0].coverBmpPath.empty() && !coverRendered) {
+    // If cover buffer restore failed, redraw cover from SD even when coverRendered is true.
+    if (hasContinueReading && !recentBooks[0].coverBmpPath.empty() && (!coverRendered || !bufferRestored)) {
       const std::string coverBmpPath =
           UITheme::getCoverThumbPath(recentBooks[0].coverBmpPath, BaseMetrics::values.homeCoverHeight);
 
@@ -398,6 +400,25 @@ void BaseTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const std:
   }
 
   if (hasContinueReading) {
+    if (StringUtils::checkFileExtension(recentBooks[0].path, ".epub") && recentBooks[0].progressPercent >= 0) {
+      const int progressBarHeight = std::max(4, BaseMetrics::values.bookProgressBarHeight);
+      const int progressBarPaddingX = 10;
+      const int progressBarWidth = std::max(0, bookWidth - progressBarPaddingX * 2);
+      const int progressBarX = bookX + progressBarPaddingX;
+      const int progressBarY = bookY + bookHeight - progressBarHeight - 10;
+      const int progressInnerHeight = std::max(0, progressBarHeight - 2);
+      const int progressInnerWidth = std::max(0, progressBarWidth - 2);
+      const int progressFillWidth = (progressInnerWidth * recentBooks[0].progressPercent) / 100;
+
+      if (progressBarWidth > 0 && progressBarHeight > 0) {
+        renderer.fillRect(progressBarX, progressBarY, progressBarWidth, progressBarHeight, false);
+        renderer.drawRect(progressBarX, progressBarY, progressBarWidth, progressBarHeight, true);
+        if (progressFillWidth > 0 && progressInnerHeight > 0) {
+          renderer.fillRect(progressBarX + 1, progressBarY + 1, progressFillWidth, progressInnerHeight, true);
+        }
+      }
+    }
+
     const std::string& lastBookTitle = recentBooks[0].title;
     const std::string& lastBookAuthor = recentBooks[0].author;
 
@@ -577,7 +598,7 @@ void BaseTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const std:
 
 void BaseTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                                const std::function<std::string(int index)>& buttonLabel,
-                               const std::function<std::string(int index)>& rowIcon) const {
+                               const std::function<UIIcon(int index)>& rowIcon) const {
   for (int i = 0; i < buttonCount; ++i) {
     const int tileY = BaseMetrics::values.verticalSpacing + rect.y +
                       static_cast<int>(i) * (BaseMetrics::values.menuRowHeight + BaseMetrics::values.menuSpacing);

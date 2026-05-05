@@ -98,6 +98,9 @@ class KeyboardEntryActivity : public Activity {
   static const char* const shiftString[3];
 
   // Special key positions (bottom row)
+  static constexpr int TOP_ROW = 0;
+  static constexpr int TOP_QR_COL = 0;
+  static constexpr int TOP_OK_COL = 1;
   static constexpr int SPECIAL_ROW = 5;
   static constexpr int SHIFT_COL = 0;
   static constexpr int SPACE_COL = 2;
@@ -112,7 +115,6 @@ class KeyboardEntryActivity : public Activity {
   int getRowLength(int row) const;
   void render() const;
   void renderQRScreen() const;
-  void renderItemWithSelector(int x, int y, const char* item, bool isSelected) const;
   void startWebInputServer();
   void stopWebInputServer();
 };

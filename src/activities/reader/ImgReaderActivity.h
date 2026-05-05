@@ -27,7 +27,7 @@ class ImgReaderActivity final : public Activity {
   bool flipHorizontalEnabled = false;
   bool menuVisible = false;
   int menuIndex = 0;
-  const std::function<void()> onGoBack;
+  const std::function<void(const std::string&)> onGoBack;
   const std::function<void()> onGoHome;
 
   void renderMenuOverlay() const;
@@ -51,7 +51,7 @@ class ImgReaderActivity final : public Activity {
   void applyRotate180ToFramebuffer() const;
   void applyHorizontalFlipToFramebuffer() const;
 
-  void renderImage();
+  bool renderImage();
   void renderBitmapFit(const Bitmap& bitmap);
   bool renderPng();
   bool renderBmp(const std::string& bmpPath);
@@ -59,7 +59,7 @@ class ImgReaderActivity final : public Activity {
 
  public:
   explicit ImgReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string imagePath,
-                             const ImageType imageType, const std::function<void()>& onGoBack,
+                             const ImageType imageType, const std::function<void(const std::string&)>& onGoBack,
                              const std::function<void()>& onGoHome)
       : Activity("ImgReader", renderer, mappedInput),
         imagePath(std::move(imagePath)),

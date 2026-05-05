@@ -114,10 +114,21 @@ class CrossPointSettings {
   };
 
   // Short power button press actions
-  enum SHORT_PWRBTN { IGNORE = 0, SLEEP = 1, PAGE_TURN = 2, SHORT_PWRBTN_COUNT };
+  enum SHORT_PWRBTN {
+    IGNORE = 0,
+    SLEEP = 1,
+    PAGE_TURN = 2,
+    FULL_REFRESH = 3,
+    SCREENSHOT = 4,
+    WIFI_TRANSFER = 5,
+    SHORT_PWRBTN_COUNT
+  };
 
   // Hide battery percentage
   enum HIDE_BATTERY_PERCENTAGE { HIDE_NEVER = 0, HIDE_READER = 1, HIDE_ALWAYS = 2, HIDE_BATTERY_PERCENTAGE_COUNT };
+
+  static constexpr uint8_t AUTO_PAGE_TURN_TIME_MIN = 3;
+  static constexpr uint8_t AUTO_PAGE_TURN_TIME_MAX = 60;
 
   // UI Theme
   enum UI_THEME { CLASSIC = 0, LYRA = 1 };
@@ -178,13 +189,20 @@ class CrossPointSettings {
   char jgAppPassword[64] = ""; // 坚果云应用密码
   char jgBookFolder[128] = ""; // 电子书文件夹路径
 
-  // Z-Library 配置
+  // Z-Library 配置//已废置
 char zlibEmail[64] = "";
 char zlibPassword[64] = "";
+
+//rss//已废置
+char rssUrl[256] = "https://wulixb.iphy.ac.cn/rss/latest.xml";
 //新加划线
 uint8_t extraline = 1;
   // Bluetooth enabled state (persistent)
   uint8_t bluetoothEnabled = 0;
+  // 自动翻页 0表示关闭 1表示开启
+  uint8_t autoPageTurn = 0;
+  // 自动翻页时间，单位为秒，范围1~60，默认5秒
+  uint8_t autoPageTurnTime = 5;
 
 
  //阅读背景设置

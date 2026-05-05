@@ -14,10 +14,14 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   std::shared_ptr<Txt> txt;
   TaskHandle_t displayTaskHandle = nullptr;
   SemaphoreHandle_t renderingMutex = nullptr;
+  volatile bool shuttingDown = false;
   int currentPage = 0;
   int totalPages = 1;
   int pagesUntilFullRefresh = 0;
   bool updateRequired = false;
+  bool skipNextButtonCheck = false;
+  bool bluetoothBootstrapDone = false;  // Run Bluetooth startup logic only once after first render
+  unsigned long lastAutoPageTurnMs = 0;
   const std::function<void()> onGoBack;
   const std::function<void()> onGoHome;
 
@@ -35,12 +39,13 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   uint8_t cachedParagraphAlignment = CrossPointSettings::LEFT_ALIGN;
 
   static void taskTrampoline(void* param);
-  [[noreturn]] void displayTaskLoop();
+  void displayTaskLoop();
   void renderScreen();
   void renderPage();
   void renderStatusBar(int orientedMarginRight, int orientedMarginBottom, int orientedMarginTop, int orientedMarginLeft) const;
 
-  bool loadPageAtOffset(size_t offset,size_t endoffset, std::vector<std::string>& outLines, size_t& nextOffset);
+  bool loadPageAtOffset(size_t offset, size_t endoffset, std::vector<std::string>& outLines, size_t& nextOffset,
+                        std::vector<int>* outIndentOffsets = nullptr);
   void buildPageIndex(size_t beginByte, size_t endByte);
  
   void saveProgress() const;
@@ -54,6 +59,8 @@ class TxtReaderActivity final : public ActivityWithSubactivity {
   //排版
   bool needIndent = SETTINGS.firstlineintented;
   uint8_t wordSpacing=1+(SETTINGS.wordSpacing)*5;
+  void renderPngSleepScreen(GfxRenderer& renderer) const ;
+  int pendingBookmarkPercent = -1;
 
 
 

@@ -16,6 +16,7 @@ class MyLibraryActivity final : public ActivityWithSubactivity {
   SemaphoreHandle_t renderingMutex = nullptr;
 
   size_t selectorIndex = 0;
+  bool topBarFocused = true;
   bool updateRequired = false;
 
   // Files state
@@ -45,6 +46,8 @@ class MyLibraryActivity final : public ActivityWithSubactivity {
 
   // pending search request from keyboard callback; handled in loop()
   bool pendingSearch = false;
+  bool pendingCloseKeyboard = false;
+  bool suppressNextConfirmRelease = false;
   std::string pendingKeyword;
 
   void executeSearch();
@@ -58,14 +61,13 @@ class MyLibraryActivity final : public ActivityWithSubactivity {
       DELETE = 1,      // 删除
       COPY = 2,        // 复制
       CUT = 3,         // 剪切
-      PASTE = 4
-      // ,        // 粘贴
-      // SEARCH = 5,        // 搜索
-      // CANCEL_SEARCH = 6   // 取消搜索
+      PASTE = 4,       // 粘贴
+      SEARCH = 5,      // 搜索
+      CANCEL_SEARCH = 6  // 取消搜索
   };
   TopOption topSelectorIndex = TopOption::OPEN;
-  const int topOptionCount = 7;
-  char SEARCH_KEYWORD[100] = "赛博"; // 搜索关键词（示例：包含“赛博”的文件）
+    const int topOptionCount = 7;
+  char SEARCH_KEYWORD[100] = ""; // 搜索关键词（示例：包含“赛博”的文件）
 
 
  public:

@@ -4,6 +4,7 @@
 #include <freertos/task.h>
 
 #include <functional>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,10 @@ class RecentBooksActivity final : public Activity {
 
   size_t selectorIndex = 0;
   bool updateRequired = false;
+  int cachedPageStart = -1;
+  int cachedListSize = -1;
+  bool pageBaseCacheValid = false;
+  std::vector<uint8_t> pageBaseCache;
 
   // Recent tab state
   std::vector<RecentBook> recentBooks;
@@ -27,7 +32,9 @@ class RecentBooksActivity final : public Activity {
 
   static void taskTrampoline(void* param);
   [[noreturn]] void displayTaskLoop();
-  void render() const;
+  void render();
+  void drawBookTile(int bookIndex, int gridX, int gridY, int tileWidth, int tileHeight, int titleLineHeight,
+                    bool selected) const;
 
   // Data loading
   void loadRecentBooks();

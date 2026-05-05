@@ -5,15 +5,20 @@
 #include <GfxRenderer.h>
 #include <SDCardManager.h>
 #include <Serialization.h>
+#include <BluetoothHIDManager.h>
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "EpubReaderChapterSelectionActivity.h"
+#include "EpubBookmarkSelectionActivity.h"
 #include "EpubReaderPercentSelectionActivity.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderSyncActivity.h"
 #include "MappedInputManager.h"
 #include "RecentBooksStore.h"
+#include "BookmarkActivity.h"
+#include "../settings/BluetoothSettingsActivity.h"
+#include "../../util/ReaderBluetoothBootstrap.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -78,6 +83,9 @@ bool loadWallpaperPxcToFramebuffer(const std::string& pxcPath, GfxRenderer& rend
   return true;
 }
 
+
+
+
 bool saveWallpaperPxcFromFramebuffer(const std::string& pxcPath, GfxRenderer& renderer) {
   uint8_t* frameBuffer = renderer.getFrameBuffer();
   if (!frameBuffer) {
@@ -116,6 +124,8 @@ bool saveWallpaperPxcFromFramebuffer(const std::string& pxcPath, GfxRenderer& re
   return true;
 }
 
+
+
 int clampPercent(int percent) {
   if (percent < 0) {
     return 0;
@@ -125,6 +135,33 @@ int clampPercent(int percent) {
   }
   return percent;
 }
+
+uint8_t clampAutoPageTurnSeconds(const uint8_t seconds) {
+  if (seconds < CrossPointSettings::AUTO_PAGE_TURN_TIME_MIN) {
+    return CrossPointSettings::AUTO_PAGE_TURN_TIME_MIN;
+  }
+  if (seconds > CrossPointSettings::AUTO_PAGE_TURN_TIME_MAX) {
+    return CrossPointSettings::AUTO_PAGE_TURN_TIME_MAX;
+  }
+  return seconds;
+}
+
+bool shouldTriggerAutoPageTurn(unsigned long& lastTriggerMs) {
+  const unsigned long now = millis();
+  if (!SETTINGS.autoPageTurn) {
+    lastTriggerMs = now;
+    return false;
+  }
+
+  const uint8_t seconds = clampAutoPageTurnSeconds(SETTINGS.autoPageTurnTime);
+  if (now - lastTriggerMs >= static_cast<unsigned long>(seconds) * 1000UL) {
+    lastTriggerMs = now;
+    return true;
+  }
+  return false;
+}
+
+
 
 // Apply the logical reader orientation to the renderer.
 // This centralizes orientation mapping so we don't duplicate switch logic elsewhere.
@@ -214,6 +251,7 @@ void EpubReaderActivity::onEnter() {
 
   // Trigger first update
   updateRequired = true;
+  lastAutoPageTurnMs = millis();
 
   xTaskCreate(&EpubReaderActivity::taskTrampoline, "EpubReaderActivityTask",
               8192,               // Stack size
@@ -225,6 +263,12 @@ void EpubReaderActivity::onEnter() {
 
 void EpubReaderActivity::onExit() {
   ActivityWithSubactivity::onExit();
+
+  // Force-release BLE resources when leaving reader to maximize memory for parsing/rendering.
+  auto& btMgr = BluetoothHIDManager::getInstance();
+  if (btMgr.isEnabled()) {
+    btMgr.disable();
+  }
 
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
@@ -245,15 +289,9 @@ void EpubReaderActivity::onExit() {
 
 void EpubReaderActivity::loop() {
   if(state== EPUBState::READING){
-    if (mappedInput.isPressed(MappedInputManager::Button::Confirm) && mappedInput.getHeldTime() >= 1000) {
-      Serial.printf("[%lu] [ERS] Long press detected, entering settings\n", millis());
-      state = EPUBState::SETTING;
-      skipNextButtonCheck = true; // 避免按钮事件冲突
-      updateRequired = true;
-      return;
-    }
     // Pass input responsibility to sub activity if exists
     if (subActivity) {
+      lastAutoPageTurnMs = millis();
       subActivity->loop();
       // Deferred exit: process after subActivity->loop() returns to avoid use-after-free
       if (pendingSubactivityExit) {
@@ -274,6 +312,14 @@ void EpubReaderActivity::loop() {
       return;
     }
 
+    if (mappedInput.isPressed(MappedInputManager::Button::Confirm) && mappedInput.getHeldTime() >= 1000) {
+      Serial.printf("[%lu] [ERS] Long press detected, entering settings\n", millis());
+      state = EPUBState::SETTING;
+      skipNextButtonCheck = true; // 避免按钮事件冲突
+      updateRequired = true;
+      return;
+    }
+
     // Handle pending go home when no subactivity (e.g., from long press back)
     if (pendingGoHome) {
       pendingGoHome = false;
@@ -287,6 +333,7 @@ void EpubReaderActivity::loop() {
     // This prevents stale button release events from triggering actions
     // We wait until: (1) all relevant buttons are released, AND (2) wasReleased events have been cleared
     if (skipNextButtonCheck) {
+      lastAutoPageTurnMs = millis();
       const bool confirmCleared = !mappedInput.isPressed(MappedInputManager::Button::Confirm) &&
                                   !mappedInput.wasReleased(MappedInputManager::Button::Confirm);
       const bool backCleared = !mappedInput.isPressed(MappedInputManager::Button::Back) &&
@@ -337,18 +384,19 @@ void EpubReaderActivity::loop() {
                                                       mappedInput.wasReleased(MappedInputManager::Button::Left));
     const bool powerPageTurn = SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PAGE_TURN &&
                               mappedInput.wasReleased(MappedInputManager::Button::Power);
+    const bool autoTurnTriggered = shouldTriggerAutoPageTurn(lastAutoPageTurnMs);
     const bool nextTriggered = usePressForPageTurn
                                   ? (mappedInput.wasPressed(MappedInputManager::Button::PageForward) || powerPageTurn ||
-                                      mappedInput.wasPressed(MappedInputManager::Button::Right))
+                                      mappedInput.wasPressed(MappedInputManager::Button::Right) || autoTurnTriggered)
                                   : (mappedInput.wasReleased(MappedInputManager::Button::PageForward) || powerPageTurn ||
-                                      mappedInput.wasReleased(MappedInputManager::Button::Right));
+                                      mappedInput.wasReleased(MappedInputManager::Button::Right) || autoTurnTriggered);
 
     if (!prevTriggered && !nextTriggered) {
       return;
     }
 
     // any botton press when at end of the book goes back to the last page
-    if (currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount()) {
+    if (!autoTurnTriggered && currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount()) {
       currentSpineIndex = epub->getSpineItemsCount() - 1;
       nextPageNumber = UINT16_MAX;
       updateRequired = true;
@@ -375,6 +423,7 @@ void EpubReaderActivity::loop() {
     }
 
     if (prevTriggered) {
+      lastAutoPageTurnMs = millis();
       if (section->currentPage > 0) {
         section->currentPage--;
       } else {
@@ -387,6 +436,9 @@ void EpubReaderActivity::loop() {
       }
       updateRequired = true;
     } else {
+      if (!autoTurnTriggered) {
+        lastAutoPageTurnMs = millis();
+      }
       if (section->currentPage < section->pageCount - 1) {
         section->currentPage++;
       } else {
@@ -401,6 +453,7 @@ void EpubReaderActivity::loop() {
     }
     //暂不启用，易起冲突，后面修改
   }else if (state == EPUBState::SETTING) {
+    lastAutoPageTurnMs = millis();
     if (mappedInput.wasPressed(MappedInputManager::Button::Back) ) {
       Serial.printf("[%lu] [ERS] Long press detected, entering reading\n", millis());
       if (pendingMarginRelayout) {
@@ -632,6 +685,83 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       xSemaphoreGive(renderingMutex);
       break;
     }
+    case EpubReaderMenuActivity::MenuAction::BOOKMARK_LIST: {
+      xSemaphoreTake(renderingMutex, portMAX_DELAY);
+      exitActivity();
+      enterNewActivity(new EpubBookmarkSelectionActivity(
+          renderer, mappedInput, epub,
+          [this]() {
+            exitActivity();
+            updateRequired = true;
+          },
+          [this](const BookmarkStore::BookmarkRecord& record) {
+            const int spineCount = epub ? epub->getSpineItemsCount() : 0;
+            const int bookmarkSpine = static_cast<int>(record.pos1);
+            const int bookmarkPage = static_cast<int>(record.pos2);
+            const int bookmarkPageCount = static_cast<int>(record.pos3);
+
+            if (spineCount > 0 && bookmarkSpine >= 0 && bookmarkSpine < spineCount && bookmarkPage >= 0) {
+              xSemaphoreTake(renderingMutex, portMAX_DELAY);
+              currentSpineIndex = bookmarkSpine;
+              nextPageNumber = bookmarkPage;
+              // Keep cached spine metadata aligned so section reload can remap page by ratio
+              // when page count changes after font/spacing/margin updates.
+              cachedSpineIndex = bookmarkSpine;
+              cachedChapterTotalPageCount = bookmarkPageCount > 0 ? bookmarkPageCount : 0;
+              section.reset();
+              xSemaphoreGive(renderingMutex);
+            } else {
+              // Fallback for old or malformed bookmark records.
+              jumpToPercent(static_cast<int>(record.progressPercent));
+            }
+            exitActivity();
+            updateRequired = true;
+          }));
+      xSemaphoreGive(renderingMutex);
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::ADD_BOOKMARK: {
+      float bookProgress = 0.0f;
+      int currentPage = 0;
+      int totalPages = 0;
+      if (section) {
+        currentPage = section->currentPage;
+        totalPages = section->pageCount;
+      }
+      if (epub && epub->getBookSize() > 0 && totalPages > 0) {
+        const float chapterProgress = static_cast<float>(currentPage) / static_cast<float>(totalPages);
+        bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
+      }
+      const int percent = clampPercent(static_cast<int>(bookProgress + 0.5f));
+
+      xSemaphoreTake(renderingMutex, portMAX_DELAY);
+      exitActivity();
+      enterNewActivity(new BookmarkActivity(
+          renderer, mappedInput, epub->getPath(), epub->getCachePath(), percent, currentSpineIndex, currentPage,
+          totalPages, [this](bool) {
+            exitActivity();
+            updateRequired = true;
+          }));
+      xSemaphoreGive(renderingMutex);
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::BLUETOOTH: {
+      xSemaphoreTake(renderingMutex, portMAX_DELAY);
+      exitActivity();
+      enterNewActivity(new BluetoothSettingsActivity(
+          renderer, mappedInput,
+          [this] {
+            exitActivity();
+            skipNextButtonCheck = true;
+            updateRequired = true;
+          }));
+      xSemaphoreGive(renderingMutex);
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::AUTO_PAGE_TURN_TOGGLE:
+    case EpubReaderMenuActivity::MenuAction::AUTO_PAGE_TURN_TIME:
+      // These actions are handled directly inside EpubReaderMenuActivity.
+      break;
     case EpubReaderMenuActivity::MenuAction::GO_HOME: {
       // Defer go home to avoid race condition with display task
       pendingGoHome = true;
@@ -958,16 +1088,50 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     renderer.drawCenteredText(UI_12_FONT_ID, boxY + 8 + 3*lineHeight, line4, true, EpdFontFamily::BOLD);    
   };
 
-  // Force full refresh for pages with images when anti-aliasing is on,
-  // as grayscale tones require half refresh to display correctly
-  bool forceFullRefresh = page->hasImages() && SETTINGS.textAntiAliasing;
+    // Double FAST_REFRESH with selective image blanking (pablohc's technique):
+    // HALF_REFRESH sets particles too firmly for the grayscale LUT to adjust.
+    // Instead, blank only the image area and do two fast refreshes.
+    // Step 1: Display page with image area blanked (text appears, image area white)
+    // Step 2: Re-render with images and display again (images appear clean)
+    // 采用双 FAST_REFRESH 并选择性区域消隐（pablohc 技术）：
+    // HALF_REFRESH 会将电子墨粒固定得过死，导致灰度 LUT 无法正常调整。
+    // 改为仅清空图像区域，并执行两次快速刷新。
+    // 步骤 1：显示时将图像区域置空（文字正常显示，图像区域为白色）
+    // 步骤 2：重新渲染图像并再次刷新（图像显示干净无残影）
+  const bool imagePageWithAA = page->hasImages() && SETTINGS.textAntiAliasing;
   page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
-  applySettingMarginPreviewOverlay();
   renderStatusBar(orientedMarginRight, orientedMarginBottom,orientedMarginTop, orientedMarginLeft);
-  if (forceFullRefresh || pagesUntilFullRefresh <= 1) {
+  applySettingMarginPreviewOverlay();
+  // if (imagePageWithAA) {
+  //   // NOTE(half-refresh-fix): Selective image-area blanking sequence:
+  //   // 1) clear image area and FAST refresh, 2) redraw full page and FAST refresh.
+  //   int16_t imgX = 0, imgY = 0, imgW = 0, imgH = 0;
+  //   if (page->getImageBoundingBox(imgX, imgY, imgW, imgH)) {
+  //     renderer.fillRect(imgX + orientedMarginLeft, imgY + orientedMarginTop, imgW, imgH, false);
+  //     applySettingMarginPreviewOverlay();
+  //     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+
+  //     // Re-render page content to restore images into the blanked area.
+  //     page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+  //     renderStatusBar(orientedMarginRight, orientedMarginBottom,orientedMarginTop, orientedMarginLeft);
+  //     applySettingMarginPreviewOverlay();
+  //     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  //   } else {
+  //     // NOTE(fallback): If image bounds are unavailable, keep the safer double FAST path.
+  //     applySettingMarginPreviewOverlay();
+  //     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  //     page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+  //     renderStatusBar(orientedMarginRight, orientedMarginBottom,orientedMarginTop, orientedMarginLeft);
+  //     applySettingMarginPreviewOverlay();
+  //     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  //   }
+  // } else 
+  if (pagesUntilFullRefresh <= 1) {
+    applySettingMarginPreviewOverlay();
     renderer.displayBuffer(HalDisplay::HALF_REFRESH);
     pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
   } else {
+    applySettingMarginPreviewOverlay();
     renderer.displayBuffer();
     pagesUntilFullRefresh--;
   }
@@ -981,14 +1145,12 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
     page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
-    applySettingMarginPreviewOverlay();
     renderer.copyGrayscaleLsbBuffers();
 
     // Render and copy to MSB buffer
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
     page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
-    applySettingMarginPreviewOverlay();
     renderer.copyGrayscaleMsbBuffers();
 
     // display grayscale part
@@ -998,6 +1160,11 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
   // restore the bw data
   renderer.restoreBwBuffer();
+
+  if (!bluetoothBootstrapDone) {
+    bluetoothBootstrapDone = true;
+    initializeBluetoothAfterReaderRender();
+  }
 }
 
 void EpubReaderActivity::renderStatusBar(const int orientedMarginRight, const int orientedMarginBottom,
@@ -1115,7 +1282,7 @@ void EpubReaderActivity::renderStatusBar(const int orientedMarginRight, const in
 
 
 void EpubReaderActivity::renderPngSleepScreen(GfxRenderer& renderer) const {
-  const std::string pxcPath = WALLPAPER_PXC_PATH;
+  const std::string pxcPath = "/.crosspoint/wallpaper_bg.pxc";
   if (loadWallpaperPxcToFramebuffer(pxcPath, renderer)) {
     Serial.printf("[%lu] [SLP] Loaded wallpaper PXC cache\n", millis());
     return;

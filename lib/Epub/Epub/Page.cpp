@@ -181,6 +181,50 @@ void Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, co
   }
 }
 
+bool Page::getImageBoundingBox(int16_t& outX, int16_t& outY, int16_t& outW, int16_t& outH) const {
+  bool foundImage = false;
+  int32_t minX = 0;
+  int32_t minY = 0;
+  int32_t maxX = 0;
+  int32_t maxY = 0;
+
+  for (const auto& element : elements) {
+    if (!element || element->getTag() != TAG_PageImage) {
+      continue;
+    }
+
+    const auto* image = static_cast<const PageImage*>(element.get());
+    const int32_t x1 = image->xPos;
+    const int32_t y1 = image->yPos;
+    const int32_t x2 = x1 + image->getWidth();
+    const int32_t y2 = y1 + image->getHeight();
+
+    if (!foundImage) {
+      minX = x1;
+      minY = y1;
+      maxX = x2;
+      maxY = y2;
+      foundImage = true;
+      continue;
+    }
+
+    minX = std::min(minX, x1);
+    minY = std::min(minY, y1);
+    maxX = std::max(maxX, x2);
+    maxY = std::max(maxY, y2);
+  }
+
+  if (!foundImage) {
+    return false;
+  }
+
+  outX = static_cast<int16_t>(minX);
+  outY = static_cast<int16_t>(minY);
+  outW = static_cast<int16_t>(std::max<int32_t>(0, maxX - minX));
+  outH = static_cast<int16_t>(std::max<int32_t>(0, maxY - minY));
+  return outW > 0 && outH > 0;
+}
+
 bool Page::serialize(FsFile& file) const {
   const uint16_t count = elements.size();
   serialization::writePod(file, count);

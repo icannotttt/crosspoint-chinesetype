@@ -200,6 +200,206 @@ void waitForPowerRelease() {
   }
 }
 
+// 全局：只用来保存一次屏幕
+uint8_t* g_savedBWBuffer = nullptr;
+size_t g_bufferSize = 0;
+
+// 直接用已保存的缓冲区生成 BMP（不再新分配内存）
+bool saveBmpFromSavedBuffer(const char* filename) {
+  if (!g_savedBWBuffer || g_bufferSize == 0) return false;
+
+  const int width = renderer.getScreenWidth();
+  const int height = renderer.getScreenHeight();
+  const int bmpBytesPerRow = (width + 7) / 8;
+  const int bmpRowAligned = (bmpBytesPerRow + 3) & ~3;
+  const size_t bmpSize = (size_t)bmpRowAligned * height;
+
+  auto rotateLogicalToPhysical = [&](int x, int y, int* phyX, int* phyY) {
+    switch (renderer.getOrientation()) {
+      case GfxRenderer::Portrait:
+        *phyX = y;
+        *phyY = HalDisplay::DISPLAY_HEIGHT - 1 - x;
+        break;
+      case GfxRenderer::LandscapeClockwise:
+        *phyX = HalDisplay::DISPLAY_WIDTH - 1 - x;
+        *phyY = HalDisplay::DISPLAY_HEIGHT - 1 - y;
+        break;
+      case GfxRenderer::PortraitInverted:
+        *phyX = HalDisplay::DISPLAY_WIDTH - 1 - y;
+        *phyY = x;
+        break;
+      case GfxRenderer::LandscapeCounterClockwise:
+        *phyX = x;
+        *phyY = y;
+        break;
+    }
+  };
+
+  FsFile file;
+  if (!SdMan.openFileForWrite("SCP", filename, file)) {
+    return false;
+  }
+
+  const uint32_t fileSize = 14 + 40 + 8 + bmpSize;
+  const uint32_t pixelDataOffset = 14 + 40 + 8;
+
+  uint8_t fileHeader[14] = {'B','M', 0,0,0,0, 0,0, 0,0, 0,0,0,0};
+  fileHeader[2] = fileSize & 0xFF;
+  fileHeader[3] = (fileSize >> 8) & 0xFF;
+  fileHeader[4] = (fileSize >> 16) & 0xFF;
+  fileHeader[5] = (fileSize >> 24) & 0xFF;
+  fileHeader[10] = pixelDataOffset & 0xFF;
+  fileHeader[11] = (pixelDataOffset >> 8) & 0xFF;
+
+  uint8_t infoHeader[40] = {0};
+  infoHeader[0] = 40;
+  infoHeader[4] = width & 0xFF;
+  infoHeader[5] = (width >> 8) & 0xFF;
+  infoHeader[6] = (width >> 16) & 0xFF;
+  infoHeader[7] = (width >> 24) & 0xFF;
+  infoHeader[8] = height & 0xFF;
+  infoHeader[9] = (height >> 8) & 0xFF;
+  infoHeader[10] = (height >> 16) & 0xFF;
+  infoHeader[11] = (height >> 24) & 0xFF;
+  infoHeader[12] = 1;
+  infoHeader[14] = 1;
+  infoHeader[32] = 2;
+  infoHeader[36] = 2;
+
+  const uint8_t palette[8] = {0,0,0,0, 255,255,255,0};
+  file.write(fileHeader, 14);
+  file.write(infoHeader, 40);
+  file.write(palette, 8);
+
+  // Stream BMP rows directly to SD to avoid allocating a full-frame BMP buffer.
+  uint8_t* rowBuf = static_cast<uint8_t*>(malloc(bmpRowAligned));
+  if (!rowBuf) {
+    Serial.printf("[SCP] 行缓冲分配失败\n");
+    file.close();
+    return false;
+  }
+
+  const uint8_t* frameBuffer = g_savedBWBuffer;
+  for (int row = 0; row < height; row++) {
+    memset(rowBuf, 0xFF, bmpRowAligned);
+
+    // Positive BMP height means rows are stored bottom-up.
+    const int logicalY = height - 1 - row;
+
+    for (int x = 0; x < width; x++) {
+      int rx = 0;
+      int ry = 0;
+      rotateLogicalToPhysical(x, logicalY, &rx, &ry);
+      if (rx < 0 || rx >= HalDisplay::DISPLAY_WIDTH || ry < 0 || ry >= HalDisplay::DISPLAY_HEIGHT) {
+        continue;
+      }
+
+      const size_t fbByteIdx = (size_t)ry * HalDisplay::DISPLAY_WIDTH_BYTES + (rx / 8);
+      const uint8_t fbBitPos = 7 - (rx % 8);
+      const bool isBlack = ((frameBuffer[fbByteIdx] >> fbBitPos) & 0x01) == 0;
+
+      const size_t outByteIdx = static_cast<size_t>(x / 8);
+      const uint8_t outBitPos = 7 - (x % 8);
+      if (isBlack) {
+        rowBuf[outByteIdx] &= ~(1U << outBitPos);
+      }
+    }
+
+    file.write(rowBuf, bmpRowAligned);
+  }
+
+  free(rowBuf);
+  file.flush();
+  file.sync();
+  file.close();
+  return true;
+}
+
+bool captureGlobalScreenshot() {
+  // 0. 先获取真实帧缓冲
+  uint8_t* mainFB = renderer.getFrameBuffer();
+  size_t fbSize = renderer.getBufferSize();
+  if (!mainFB || fbSize == 0) return false;
+
+  // ============================
+  // 1. 保存当前BW层 → **只 malloc 这一次！**
+  // ============================
+  g_savedBWBuffer = (uint8_t*)malloc(fbSize);
+  g_bufferSize = fbSize;
+  if (!g_savedBWBuffer) {
+    Serial.printf("[SCP] 内存不足，无法保存屏幕\n");
+    return false;
+  }
+  memcpy(g_savedBWBuffer, mainFB, fbSize);
+
+  // 2. 生成截图文件名
+  SdMan.mkdir("/screenshots");
+  uint32_t stamp = millis();
+  std::string filePath = "/screenshots/screen_" + std::to_string(stamp) + ".bmp";
+
+  // 3. 用已保存的缓冲区写入BMP
+  bool ok = saveBmpFromSavedBuffer(filePath.c_str());
+  if (!ok) {
+    free(g_savedBWBuffer);
+    g_savedBWBuffer = nullptr;
+    return false;
+  }
+
+  // ============================
+  // 4. 绘制“已截屏”提示
+  // ============================
+  int boxW = 180, boxH = 44;
+  int boxX = (renderer.getScreenWidth() - boxW) / 2;
+  int boxY = 24;
+  renderer.fillRect(boxX, boxY, boxW, boxH, false);
+  renderer.drawRect(boxX, boxY, boxW, boxH, true);
+  renderer.drawCenteredText(UI_10_FONT_ID, boxY+13, "已截屏", true, EpdFontFamily::BOLD);
+  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  delay(1000);
+
+  // ============================
+  // 5. 用保存的BW层恢复之前界面 ✅
+  // ============================
+  memcpy(mainFB, g_savedBWBuffer, fbSize);
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+
+  // ============================
+  // 6. 释放保存的BW层 ✅
+  // ============================
+  free(g_savedBWBuffer);
+  g_savedBWBuffer = nullptr;
+
+  Serial.printf("[SCP] 截图完成，内存已释放\n");
+  return true;
+}
+
+// Two-phase clean refresh for the current screen content:
+// 1) clear to white and FAST refresh, 2) restore previous frame and FAST refresh.
+bool performCleanRefreshFromCurrentFrame() {
+  uint8_t* mainFB = renderer.getFrameBuffer();
+  size_t fbSize = renderer.getBufferSize();
+  if (!mainFB || fbSize == 0) {
+    return false;
+  }
+
+  uint8_t* savedBuffer = static_cast<uint8_t*>(malloc(fbSize));
+  if (!savedBuffer) {
+    Serial.printf("[PWR] Clean refresh failed: not enough memory\n");
+    return false;
+  }
+
+  memcpy(savedBuffer, mainFB, fbSize);
+
+  renderer.clearScreen(0xFF);
+  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+
+  memcpy(mainFB, savedBuffer, fbSize);
+  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+
+  free(savedBuffer);
+  return true;
+}
+
 // Enter deep sleep mode
 void enterDeepSleep() {
   //等待渲染完成
@@ -353,44 +553,11 @@ void setup() {
   UITheme::getInstance().reload();
 
   ButtonNavigator::setMappedInputManager(mappedInputManager);
-  
-  // Initialize Bluetooth HID button injection
-  try {
-    auto& btMgr = BluetoothHIDManager::getInstance();
-    btMgr.setButtonInjector([](uint8_t buttonIndex) {
-      gpio.injectButtonPress(buttonIndex);
-    });
-    
-    // Enable Bluetooth on boot if configured
-    if (SETTINGS.bluetoothEnabled) {
-      if (btMgr.enable()) {
-        Serial.printf("MAIN", "Bluetooth enabled on boot");
-
-        // Auto-reconnect: attempt to connect to the last paired device up to 3 times
-        std::string lastAddr, lastName;
-        btMgr.startScan(2000);
-        if (btMgr.loadLastConnectedDevice(lastAddr, lastName)) {
-          Serial.printf("MAIN", "Auto-connecting to last device %s (%s)", lastName.c_str(), lastAddr.c_str());
-          if (btMgr.connectToDeviceWithRetries(lastAddr, 1)) {
-            Serial.printf("MAIN", "Auto-connect successful");
-          } else {
-            Serial.printf("MAIN", "Auto-connect failed after retries");
-          }
-        }
-
-      } else {
-        Serial.printf("MAIN", "Failed to enable Bluetooth on boot");
-      }
-    }
-    
-    Serial.printf("MAIN", "Bluetooth HID initialized with button injection");
-  } catch (...) {
-    Serial.printf("MAIN", "Failed to initialize Bluetooth HID");
-  }
 
   switch (gpio.getWakeupReason()) {
     case HalGPIO::WakeupReason::PowerButton:
-      // For normal wakeups, verify power button press duration
+      // Verify hold duration before any heavy initialization (e.g. BLE scan/connect),
+      // otherwise delayed verification may incorrectly force deep sleep.
       Serial.printf("[%lu] [   ] Verifying power button press duration\n", millis());
       verifyPowerButtonDuration();
       break;
@@ -405,7 +572,7 @@ void setup() {
     default:
       break;
   }
-
+  
   // First serial output only here to avoid timing inconsistencies for power button press duration verification
   Serial.printf("[%lu] [   ] Starting CrossPoint version " CROSSPOINT_VERSION "\n", millis());
 
@@ -450,6 +617,13 @@ void loop() {
   static unsigned long maxLoopDuration = 0;
   const unsigned long loopStartTime = millis();
   static unsigned long lastMemPrint = 0;
+  static bool powerShortClickPending = false;
+  static unsigned long powerLastReleaseMs = 0;
+  static uint8_t pendingShortPwrAction = CrossPointSettings::SHORT_PWRBTN::IGNORE;
+
+
+
+  constexpr unsigned long POWER_DOUBLE_CLICK_WINDOW_MS = 350;
 
   gpio.update();
 
@@ -504,6 +678,89 @@ void loop() {
     enterDeepSleep();
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
     return;
+  }
+
+  const bool powerReleased = mappedInputManager.wasReleased(MappedInputManager::Button::Power);
+  const unsigned long nowMs = millis();
+
+  if (powerReleased) {
+    if (powerShortClickPending && (nowMs - powerLastReleaseMs) <= POWER_DOUBLE_CLICK_WINDOW_MS) {
+      powerShortClickPending = false;
+
+      // Double-click cycles short power action:
+      // IGNORE -> PAGE_TURN -> FULL_REFRESH -> SCREENSHOT -> WIFI_TRANSFER -> IGNORE.
+      switch (SETTINGS.shortPwrBtn) {
+        case CrossPointSettings::SHORT_PWRBTN::IGNORE:
+          SETTINGS.shortPwrBtn = CrossPointSettings::SHORT_PWRBTN::PAGE_TURN;
+          break;
+        case CrossPointSettings::SHORT_PWRBTN::PAGE_TURN:
+          SETTINGS.shortPwrBtn = CrossPointSettings::SHORT_PWRBTN::FULL_REFRESH;
+          break;
+        case CrossPointSettings::SHORT_PWRBTN::FULL_REFRESH:
+          SETTINGS.shortPwrBtn = CrossPointSettings::SHORT_PWRBTN::SCREENSHOT;
+          break;
+        case CrossPointSettings::SHORT_PWRBTN::SCREENSHOT:
+          SETTINGS.shortPwrBtn = CrossPointSettings::SHORT_PWRBTN::WIFI_TRANSFER;
+          break;
+        case CrossPointSettings::SHORT_PWRBTN::WIFI_TRANSFER:
+        default:
+          SETTINGS.shortPwrBtn = CrossPointSettings::SHORT_PWRBTN::IGNORE;
+          break;
+      }
+
+      SETTINGS.saveToFile();
+      const char* shortPwrName = "忽略";
+      switch (SETTINGS.shortPwrBtn) {
+        case CrossPointSettings::SHORT_PWRBTN::PAGE_TURN:
+          shortPwrName = "翻页";
+          break;
+        case CrossPointSettings::SHORT_PWRBTN::FULL_REFRESH:
+          shortPwrName = "全刷";
+          break;
+        case CrossPointSettings::SHORT_PWRBTN::SCREENSHOT:
+          shortPwrName = "截屏";
+          break;
+        case CrossPointSettings::SHORT_PWRBTN::WIFI_TRANSFER:
+          shortPwrName = "wifi传书";
+          break;
+        case CrossPointSettings::SHORT_PWRBTN::IGNORE:
+        default:
+          shortPwrName = "忽略";
+          break;
+      }
+      Serial.printf("[%lu] [PWR] Double-click: short power action switched to %s\n", nowMs,
+                    shortPwrName);
+        // ============================
+        int boxW = 180, boxH = 44;
+        int boxX = (renderer.getScreenWidth() - boxW) / 2;
+        int boxY = 24;
+        renderer.fillRect(boxX, boxY, boxW, boxH, false);
+        renderer.drawRect(boxX, boxY, boxW, boxH, true);
+        char switchMsg[64];
+        snprintf(switchMsg, sizeof(switchMsg), "已切换为%s", shortPwrName);
+        renderer.drawCenteredText(UI_10_FONT_ID, boxY + 13, switchMsg, true, EpdFontFamily::BOLD);
+        renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+        delay(1000);
+    } else {
+      powerShortClickPending = true;
+      powerLastReleaseMs = nowMs;
+      pendingShortPwrAction = SETTINGS.shortPwrBtn;
+    }
+  }
+
+  // Delay single-click handling to ensure a potential second click can be detected.
+  if (powerShortClickPending && (nowMs - powerLastReleaseMs) > POWER_DOUBLE_CLICK_WINDOW_MS) {
+    powerShortClickPending = false;
+
+    if (pendingShortPwrAction == CrossPointSettings::SHORT_PWRBTN::FULL_REFRESH) {
+
+      //还是先改回半刷
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    } else if (pendingShortPwrAction == CrossPointSettings::SHORT_PWRBTN::SCREENSHOT) {
+      captureGlobalScreenshot();
+    } else if (pendingShortPwrAction == CrossPointSettings::SHORT_PWRBTN::WIFI_TRANSFER) {
+      onGoToFileTransfer();
+    }
   }
 
   const unsigned long activityStartTime = millis();

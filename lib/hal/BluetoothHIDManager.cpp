@@ -90,7 +90,8 @@ bool BluetoothHIDManager::enable() {
     // Initialize NimBLE stack
     NimBLEDevice::init("CrossPoint");
     NimBLEDevice::setPower(ESP_PWR_LVL_P9); // +9dBm
-    NimBLEDevice::setSecurityAuth(true, false, true);
+    // 绑定(Bonding) / 加密(Encryption) / 认证(Authentication)
+    NimBLEDevice::setSecurityAuth(true, true, true);
     
     _enabled = true;
     lastError = "";
@@ -231,6 +232,7 @@ void BluetoothHIDManager::onScanResult(NimBLEAdvertisedDevice* advertisedDevice)
     if (dev.address == address) {
       dev.rssi = rssi; // Update RSSI
       if (isHID) dev.isHID = true;
+      dev.addrType = advertisedDevice->getAddress().getType();
       return;
     }
   }
@@ -241,6 +243,7 @@ void BluetoothHIDManager::onScanResult(NimBLEAdvertisedDevice* advertisedDevice)
   device.name = name.empty() ? "Unknown" : name;
   device.rssi = rssi;
   device.isHID = isHID;
+  device.addrType = advertisedDevice->getAddress().getType();
   
   _discoveredDevices.push_back(device);
 
@@ -306,13 +309,37 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
     static ClientCallbacks clientCallbacks;
     pClient->setClientCallbacks(&clientCallbacks);
 
-    // ====================== 唯一修复：随机地址类型 ======================
-    NimBLEAddress bleAddress(address, BLE_ADDR_RANDOM);
-    // ====================================================================
-    
-    if (!pClient->connect(bleAddress)) {
+    // Try both address types for compatibility:
+    // 1) use scanned type if available (otherwise public)
+    // 2) fallback to the other type if first attempt fails
+    uint8_t primaryType = BLE_ADDR_PUBLIC;
+    for (const auto& dev : _discoveredDevices) {
+      if (dev.address == address) {
+        primaryType = dev.addrType;
+        break;
+      }
+    }
+
+    uint8_t fallbackType = (primaryType == BLE_ADDR_RANDOM) ? BLE_ADDR_PUBLIC : BLE_ADDR_RANDOM;
+
+    auto tryConnectWithType = [&](uint8_t type) -> bool {
+      NimBLEAddress bleAddress(address, type);
+      Serial.printf("BT Trying connect to %s with addr type: %s",
+                    address.c_str(),
+                    (type == BLE_ADDR_RANDOM) ? "RANDOM" : "PUBLIC");
+      return pClient->connect(bleAddress);
+    };
+
+    bool connected = tryConnectWithType(primaryType);
+    if (!connected) {
+      Serial.printf("BT First address type failed, trying fallback type...");
+      // If scan type wasn't known we still try the opposite type for robustness.
+      connected = tryConnectWithType(fallbackType);
+    }
+
+    if (!connected) {
       lastError = "Connection failed";
-      Serial.printf("BT Failed to connect to %s", address.c_str());
+      Serial.printf("BT Failed to connect to %s with both address types", address.c_str());
       try {
         NimBLEDevice::deleteClient(pClient);
       } catch (...) {
@@ -551,6 +578,39 @@ void BluetoothHIDManager::setButtonInjector(std::function<void(uint8_t)> injecto
   Serial.printf("BT Button injector registered");
 }
 
+void BluetoothHIDManager::beginKeyMapping(
+    const std::function<void(uint8_t keycode, uint8_t reportByteIndex)>& callback) {
+  _keyMappingCallback = callback;
+  _keyMappingActive = true;
+  Serial.printf("BT Key mapping mode started");
+}
+
+void BluetoothHIDManager::endKeyMapping() {
+  _keyMappingActive = false;
+  _keyMappingCallback = nullptr;
+  for (auto& device : _connectedDevices) {
+    device.lastButtonState = false;
+    device.lastHIDKeycode = 0x00;
+  }
+  Serial.printf("BT Key mapping mode ended");
+}
+
+bool BluetoothHIDManager::extractEffectiveKeycode(const uint8_t* pData, size_t length, uint8_t& keycode,
+                                                  uint8_t& reportByteIndex) {
+  if (!pData || length == 0) {
+    return false;
+  }
+  // Remove all 0x00 fields and keep the first effective byte as keycode.
+  for (size_t i = 0; i < length; ++i) {
+    if (pData[i] != 0x00) {
+      keycode = pData[i];
+      reportByteIndex = static_cast<uint8_t>(i);
+      return true;
+    }
+  }
+  return false;
+}
+
 bool BluetoothHIDManager::hasRecentActivity() const {
   // Check if any connected device has had activity in the last 4 minutes
   // This prevents power sleep while using BLE controller
@@ -591,17 +651,45 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
 
   device->lastActivityTime = millis();
 
+  if (g_instance->_keyMappingActive) {
+    uint8_t effectiveKeycode = 0x00;
+    uint8_t reportByteIndex = 0xFF;
+    const bool pressed = extractEffectiveKeycode(pData, length, effectiveKeycode, reportByteIndex);
+
+    if (!pressed) {
+      device->lastButtonState = false;
+      device->lastHIDKeycode = 0x00;
+      return;
+    }
+
+    const bool isRepeat = device->lastButtonState && (device->lastHIDKeycode == effectiveKeycode);
+    if (isRepeat) {
+      return;
+    }
+
+    device->lastButtonState = true;
+    device->lastHIDKeycode = effectiveKeycode;
+    Serial.printf("BT Mapping key captured: code=0x%02X byte=%u", effectiveKeycode, reportByteIndex);
+    if (g_instance->_keyMappingCallback) {
+      g_instance->_keyMappingCallback(effectiveKeycode, reportByteIndex);
+    }
+    return;
+  }
+
   uint8_t  keycode = 0x00;
   bool    isPressed = false;
 
-  if (length < 2) return;
+  const DeviceProfiles::DeviceProfile* activeProfile = device->profile;
+  if (const DeviceProfiles::DeviceProfile* customProfile = DeviceProfiles::getCustomProfile()) {
+    activeProfile = customProfile;
+  }
 
-  if (device->profile) {
+  if (activeProfile) {
     // 原有设备逻辑不变
-    if (length >= device->profile->reportByteIndex + 1) {
-      keycode = pData[device->profile->reportByteIndex];
+    if (length >= activeProfile->reportByteIndex + 1) {
+      keycode = pData[activeProfile->reportByteIndex];
     }
-    if (strcmp(device->profile->name, "IINE Game Brick") == 0) {
+    if (strcmp(activeProfile->name, "IINE Game Brick") == 0) {
       isPressed = (pData[0] & 0x01) != 0;
     } else {
       isPressed = (keycode != 0x00);
@@ -726,18 +814,27 @@ uint8_t BluetoothHIDManager::mapKeycodeToButton(uint8_t keycode, const DevicePro
     Serial.printf("BT mapKeycodeToButton() called with keycode: 0x%02X", keycode);
   }
   
-  // If we have a device profile, ONLY map keycodes specific to that profile
-  if (profile) {
-    if (keycode == profile->pageUpCode) {
-      Serial.printf("BT Matched profile pageUpCode 0x%02X (%s) -> PageBack", keycode, profile->name);
+  const DeviceProfiles::DeviceProfile* effectiveProfile = profile;
+  const DeviceProfiles::DeviceProfile* customProfile = DeviceProfiles::getCustomProfile();
+  if (customProfile) {
+    effectiveProfile = customProfile;
+  }
+
+  // If we have a profile, ONLY map keycodes specific to that profile
+  if (effectiveProfile) {
+    if (keycode == effectiveProfile->pageUpCode) {
+      Serial.printf("BT Matched profile pageUpCode 0x%02X (%s) -> PageBack", keycode,
+                    effectiveProfile->name);
       return HalGPIO::BTN_UP;
-    } else if (keycode == profile->pageDownCode) {
-      Serial.printf("BT Matched profile pageDownCode 0x%02X (%s) -> PageForward", keycode, profile->name);
+    } else if (keycode == effectiveProfile->pageDownCode) {
+      Serial.printf("BT Matched profile pageDownCode 0x%02X (%s) -> PageForward", keycode,
+                    effectiveProfile->name);
       return HalGPIO::BTN_DOWN;
     } else {
       // Not a profile-mapped keycode - ignore it
       Serial.printf("BT Keycode 0x%02X not in profile %s (expecting 0x%02X/0x%02X), ignoring", 
-              keycode, profile->name, profile->pageUpCode, profile->pageDownCode);
+              keycode, effectiveProfile->name, effectiveProfile->pageUpCode,
+              effectiveProfile->pageDownCode);
       return 0xFF;
     }
   }
@@ -778,7 +875,8 @@ void BluetoothHIDManager::updateActivity() {
   for (auto& device : _connectedDevices) {
     if (device.lastActivityTime > 0) {
       unsigned long inactiveTime = now - device.lastActivityTime;
-      if (inactiveTime > INACTIVITY_TIMEOUT_MS) {
+      //和休眠时间绑定
+      if (inactiveTime >= SETTINGS.getSleepTimeoutMs()) {
         Serial.printf("BT Device %s inactive for %lu ms, disconnecting", device.address.c_str(), inactiveTime);
         disconnectFromDevice(device.address);
         break;  // List modified, exit loop
@@ -823,60 +921,102 @@ void BluetoothHIDManager::checkAutoReconnect() {
 }
 
 void BluetoothHIDManager::saveState() {
-  Serial.printf("BT Saving state (stub)");
-  // Stub: would save paired devices to file
-}
+  Serial.printf("BT Saving state");
 
-void BluetoothHIDManager::loadState() {
-  Serial.printf("BT Loading state (stub)");
-  // Stub: would load paired devices from file
-}
-
-void BluetoothHIDManager::saveLastConnectedDevice(const std::string& address, const std::string& name) {
-  Serial.printf("BT Saving last connected device: %s (%s)", name.c_str(), address.c_str());
-  
-  // Make sure the directory exists
   SdMan.mkdir("/.crosspoint");
-  
+
   FsFile outputFile;
   if (!SdMan.openFileForWrite("BT", "/.crosspoint/bluetooth.bin", outputFile)) {
     Serial.printf("BT Failed to open bluetooth.bin for writing");
     return;
   }
-  
-  // Write version
-  uint8_t version = 1;
+
+  const uint8_t version = 2;
   serialization::writePod(outputFile, version);
-  
-  // Write device info
-  serialization::writeString(outputFile, address);
-  serialization::writeString(outputFile, name);
-  
+
+  serialization::writeString(outputFile, _lastConnectedAddress);
+  serialization::writeString(outputFile, _lastConnectedName);
+
+  const DeviceProfiles::DeviceProfile* custom = DeviceProfiles::getCustomProfile();
+  const uint8_t hasCustomProfile = custom ? 1 : 0;
+  serialization::writePod(outputFile, hasCustomProfile);
+  if (custom) {
+    serialization::writePod(outputFile, custom->pageUpCode);
+    serialization::writePod(outputFile, custom->pageDownCode);
+    serialization::writePod(outputFile, custom->reportByteIndex);
+    Serial.printf("BT Saved custom mapping: up=0x%02X down=0x%02X byte=%u", custom->pageUpCode,
+                  custom->pageDownCode, custom->reportByteIndex);
+  }
+
   outputFile.close();
+  Serial.printf("BT State saved");
+}
+
+void BluetoothHIDManager::loadState() {
+  Serial.printf("BT Loading state");
+
+  FsFile inputFile;
+  if (!SdMan.openFileForRead("BT", "/.crosspoint/bluetooth.bin", inputFile)) {
+    Serial.printf("BT No bluetooth.bin found");
+    return;
+  }
+
+  uint8_t version = 0;
+  serialization::readPod(inputFile, version);
+  if (version == 1) {
+    serialization::readString(inputFile, _lastConnectedAddress);
+    serialization::readString(inputFile, _lastConnectedName);
+    DeviceProfiles::clearCustomProfile();
+    inputFile.close();
+    Serial.printf("BT Loaded v1 state: %s (%s)", _lastConnectedName.c_str(), _lastConnectedAddress.c_str());
+    return;
+  }
+
+  if (version != 2) {
+    Serial.printf("BT Unknown bluetooth.bin version: %u", version);
+    inputFile.close();
+    return;
+  }
+
+  serialization::readString(inputFile, _lastConnectedAddress);
+  serialization::readString(inputFile, _lastConnectedName);
+
+  uint8_t hasCustomProfile = 0;
+  serialization::readPod(inputFile, hasCustomProfile);
+  if (hasCustomProfile) {
+    uint8_t pageUpCode = 0x00;
+    uint8_t pageDownCode = 0x00;
+    uint8_t reportByteIndex = 2;
+    serialization::readPod(inputFile, pageUpCode);
+    serialization::readPod(inputFile, pageDownCode);
+    serialization::readPod(inputFile, reportByteIndex);
+    DeviceProfiles::setCustomProfile(pageUpCode, pageDownCode, reportByteIndex);
+    Serial.printf("BT Loaded custom mapping: up=0x%02X down=0x%02X byte=%u", pageUpCode, pageDownCode,
+                  reportByteIndex);
+  } else {
+    DeviceProfiles::clearCustomProfile();
+  }
+
+  inputFile.close();
+  Serial.printf("BT State loaded: %s (%s)", _lastConnectedName.c_str(), _lastConnectedAddress.c_str());
+}
+
+void BluetoothHIDManager::saveLastConnectedDevice(const std::string& address, const std::string& name) {
+  Serial.printf("BT Saving last connected device: %s (%s)", name.c_str(), address.c_str());
+
+  _lastConnectedAddress = address;
+  _lastConnectedName = name;
+  saveState();
   Serial.printf("BT Last connected device saved successfully");
 }
 
 bool BluetoothHIDManager::loadLastConnectedDevice(std::string& address, std::string& name) {
-  FsFile inputFile;
-  if (!SdMan.openFileForRead("BT", "/.crosspoint/bluetooth.bin", inputFile)) {
-    Serial.printf("BT No saved bluetooth device found");
-    return false;
+  if (_lastConnectedAddress.empty()) {
+    loadState();
   }
-  
-  // Read version
-  uint8_t version;
-  serialization::readPod(inputFile, version);
-  if (version != 1) {
-    Serial.printf("BT Unknown bluetooth.bin version: %d", version);
-    inputFile.close();
-    return false;
-  }
-  
-  // Read device info
-  serialization::readString(inputFile, address);
-  serialization::readString(inputFile, name);
-  
-  inputFile.close();
+
+  address = _lastConnectedAddress;
+  name = _lastConnectedName;
   if (address.empty()) {
     Serial.printf("BT Loaded bluetooth.bin but address field is empty");
     return false;

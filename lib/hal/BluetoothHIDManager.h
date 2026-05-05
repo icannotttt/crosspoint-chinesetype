@@ -17,6 +17,7 @@ struct BluetoothDevice {
   std::string name;
   int rssi;
   bool isHID = false;
+  uint8_t addrType = 0;
 };
 
 struct ConnectedDevice {
@@ -65,6 +66,10 @@ public:
   void processInputEvents();
   void setInputCallback(std::function<void(uint16_t keycode)> callback);
   void setButtonInjector(std::function<void(uint8_t buttonIndex)> injector);
+  // Key mapping mode: report effective keycode and byte index from raw HID report.
+  void beginKeyMapping(const std::function<void(uint8_t keycode, uint8_t reportByteIndex)>& callback);
+  void endKeyMapping();
+  bool isKeyMappingActive() const { return _keyMappingActive; }
   void updateActivity();  // Call periodically to check inactivity timeout
   void checkAutoReconnect();  // Auto-reconnect to previously connected devices if disconnected
   
@@ -98,13 +103,19 @@ private:
   uint16_t parseHIDReport(uint8_t* data, size_t length);
   ConnectedDevice* findConnectedDevice(const std::string& address);
   uint8_t mapKeycodeToButton(uint8_t keycode, const DeviceProfiles::DeviceProfile* profile);
+  static bool extractEffectiveKeycode(const uint8_t* pData, size_t length, uint8_t& keycode,
+                                      uint8_t& reportByteIndex);
 
   bool _enabled = false;
   bool _scanning = false;
   std::vector<BluetoothDevice> _discoveredDevices;
   std::vector<ConnectedDevice> _connectedDevices;
+  std::string _lastConnectedAddress;
+  std::string _lastConnectedName;
   std::function<void(uint16_t)> _inputCallback;
   std::function<void(uint8_t)> _buttonInjector;
+  bool _keyMappingActive = false;
+  std::function<void(uint8_t, uint8_t)> _keyMappingCallback;
   
   // Inactivity timeout (milliseconds)
   static constexpr unsigned long INACTIVITY_TIMEOUT_MS = 120000;  // 2 minutes

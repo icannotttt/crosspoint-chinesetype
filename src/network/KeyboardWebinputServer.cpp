@@ -5,7 +5,16 @@
 #include <esp_wifi.h>
 
 #include "NetworkConstants.h"
+#include "WifiCredentialStore.h"
 #include "html/TextInputPageHtml.generated.h"
+
+#include <algorithm>
+#include <vector>
+
+namespace {
+constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 5000;
+constexpr int MAX_STA_CONNECT_ATTEMPTS = 3;
+}  // namespace
 
 KeyboardWebInputServer::~KeyboardWebInputServer() { stop(); }
 
@@ -26,11 +35,19 @@ bool KeyboardWebInputServer::start() {
   const wifi_mode_t wifiMode = WiFi.getMode();
   const bool isStaConnected = (wifiMode & WIFI_MODE_STA) && (WiFi.status() == WL_CONNECTED);
 
+  staModeStarted = false;
+
   if (isStaConnected) {
     // Reuse existing WiFi connection
     apModeStarted = false;
     ipAddress = WiFi.localIP().toString().c_str();
     Serial.printf("[%lu] [KB-WEB] Using existing STA connection, IP: %s\n", millis(), ipAddress.c_str());
+  } else if (tryConnectSavedNetwork()) {
+    // Connected to an existing network using saved credentials
+    apModeStarted = false;
+    staModeStarted = true;
+    ipAddress = WiFi.localIP().toString().c_str();
+    Serial.printf("[%lu] [KB-WEB] Connected using saved WiFi, IP: %s\n", millis(), ipAddress.c_str());
   } else {
     // Start our own Access Point
     Serial.printf("[%lu] [KB-WEB] No WiFi connection, starting AP...\n", millis());
@@ -116,6 +133,12 @@ void KeyboardWebInputServer::stop() {
     WiFi.mode(WIFI_OFF);
     apModeStarted = false;
     Serial.printf("[%lu] [KB-WEB] AP stopped\n", millis());
+  } else if (staModeStarted) {
+    WiFi.disconnect(false);
+    delay(30);
+    WiFi.mode(WIFI_OFF);
+    staModeStarted = false;
+    Serial.printf("[%lu] [KB-WEB] STA connection stopped\n", millis());
   } else {
     // Restore previous WiFi sleep mode
     esp_wifi_set_ps(previousSleepMode);
@@ -153,6 +176,87 @@ std::string KeyboardWebInputServer::getUrl() const {
 
 std::string KeyboardWebInputServer::getWifiQRString() const {
   return std::string("WIFI:S:") + NetworkConstants::AP_SSID + ";;";
+}
+
+bool KeyboardWebInputServer::tryConnectSavedNetwork() {
+  WIFI_STORE.loadFromFile();
+  const auto& saved = WIFI_STORE.getCredentials();
+  if (saved.empty()) {
+    Serial.printf("[%lu] [KB-WEB] No saved WiFi credentials\n", millis());
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  const int16_t scanCount = WiFi.scanNetworks(false, true);
+  if (scanCount <= 0) {
+    Serial.printf("[%lu] [KB-WEB] WiFi scan failed or no networks found (%d)\n", millis(), scanCount);
+    WiFi.scanDelete();
+    return false;
+  }
+
+  struct Candidate {
+    std::string ssid;
+    std::string password;
+    int32_t rssi;
+  };
+
+  std::vector<Candidate> candidates;
+  candidates.reserve(static_cast<size_t>(scanCount));
+
+  for (int i = 0; i < scanCount; i++) {
+    const std::string ssid = WiFi.SSID(i).c_str();
+    if (ssid.empty()) {
+      continue;
+    }
+
+    for (const auto& cred : saved) {
+      if (cred.ssid == ssid) {
+        candidates.push_back({cred.ssid, cred.password, WiFi.RSSI(i)});
+        break;
+      }
+    }
+  }
+
+  WiFi.scanDelete();
+
+  if (candidates.empty()) {
+    Serial.printf("[%lu] [KB-WEB] No saved WiFi networks are currently available\n", millis());
+    return false;
+  }
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const Candidate& a, const Candidate& b) { return a.rssi > b.rssi; });
+
+  const size_t attemptCount = std::min(candidates.size(), static_cast<size_t>(MAX_STA_CONNECT_ATTEMPTS));
+  for (size_t i = 0; i < attemptCount; i++) {
+    const Candidate& c = candidates[i];
+    Serial.printf("[%lu] [KB-WEB] Trying saved network: %s (RSSI=%ld)\n", millis(), c.ssid.c_str(),
+                  static_cast<long>(c.rssi));
+
+    WiFi.disconnect();
+    delay(50);
+    if (!c.password.empty()) {
+      WiFi.begin(c.ssid.c_str(), c.password.c_str());
+    } else {
+      WiFi.begin(c.ssid.c_str());
+    }
+
+    const unsigned long startAt = millis();
+    while (millis() - startAt < WIFI_CONNECT_TIMEOUT_MS) {
+      if (WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0)) {
+        Serial.printf("[%lu] [KB-WEB] Connected to saved network: %s\n", millis(), c.ssid.c_str());
+        return true;
+      }
+      delay(100);
+    }
+  }
+
+  WiFi.disconnect();
+  Serial.printf("[%lu] [KB-WEB] Failed to connect to any saved network\n", millis());
+  return false;
 }
 
 void KeyboardWebInputServer::setupRoutes() {

@@ -2,9 +2,22 @@
 
 #include <GfxRenderer.h>
 
+#include "CrossPointSettings.h"
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+
+namespace {
+uint8_t clampAutoPageTurnSeconds(const uint8_t seconds) {
+  if (seconds < CrossPointSettings::AUTO_PAGE_TURN_TIME_MIN) {
+    return CrossPointSettings::AUTO_PAGE_TURN_TIME_MIN;
+  }
+  if (seconds > CrossPointSettings::AUTO_PAGE_TURN_TIME_MAX) {
+    return CrossPointSettings::AUTO_PAGE_TURN_TIME_MAX;
+  }
+  return seconds;
+}
+}
 
 void EpubReaderMenuActivity::onEnter() {
   ActivityWithSubactivity::onEnter();
@@ -65,6 +78,21 @@ void EpubReaderMenuActivity::loop() {
       updateRequired = true;
       return;
     }
+    if (selectedAction == MenuAction::AUTO_PAGE_TURN_TOGGLE) {
+      SETTINGS.autoPageTurn = SETTINGS.autoPageTurn ? 0 : 1;
+      SETTINGS.saveToFile();
+      updateRequired = true;
+      return;
+    }
+    if (selectedAction == MenuAction::AUTO_PAGE_TURN_TIME) {
+      uint8_t next = clampAutoPageTurnSeconds(SETTINGS.autoPageTurnTime);
+      next = (next >= CrossPointSettings::AUTO_PAGE_TURN_TIME_MAX) ? CrossPointSettings::AUTO_PAGE_TURN_TIME_MIN
+                                                                    : static_cast<uint8_t>(next + 1);
+      SETTINGS.autoPageTurnTime = next;
+      SETTINGS.saveToFile();
+      updateRequired = true;
+      return;
+    }
 
     // 1. Capture the callback and action locally
     auto actionCallback = onAction;
@@ -83,60 +111,47 @@ void EpubReaderMenuActivity::loop() {
 
 void EpubReaderMenuActivity::renderScreen() {
   renderer.clearScreen();
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto orientation = renderer.getOrientation();
-  // Landscape orientation: button hints are drawn along a vertical edge, so we
-  // reserve a horizontal gutter to prevent overlap with menu content.
-  const bool isLandscapeCw = orientation == GfxRenderer::Orientation::LandscapeClockwise;
-  const bool isLandscapeCcw = orientation == GfxRenderer::Orientation::LandscapeCounterClockwise;
-  // Inverted portrait: button hints appear near the logical top, so we reserve
-  // vertical space to keep the header and list clear.
-  const bool isPortraitInverted = orientation == GfxRenderer::Orientation::PortraitInverted;
-  const int hintGutterWidth = (isLandscapeCw || isLandscapeCcw) ? 30 : 0;
-  // Landscape CW places hints on the left edge; CCW keeps them on the right.
-  const int contentX = isLandscapeCw ? hintGutterWidth : 0;
-  const int contentWidth = pageWidth - hintGutterWidth;
-  const int hintGutterHeight = isPortraitInverted ? 50 : 0;
-  const int contentY = hintGutterHeight;
+  const int pageWidth = renderer.getScreenWidth();
+  const int pageHeight = renderer.getScreenHeight();
+  const auto metrics = UITheme::getInstance().getMetrics();
 
-  // Title
-  const std::string truncTitle =
-      renderer.truncatedText(UI_12_FONT_ID, title.c_str(), contentWidth - 40, EpdFontFamily::BOLD);
-  // Manual centering so we can respect the content gutter.
-  const int titleX =
-      contentX + (contentWidth - renderer.getTextWidth(UI_12_FONT_ID, truncTitle.c_str(), EpdFontFamily::BOLD)) / 2;
-  renderer.drawText(UI_12_FONT_ID, titleX, 15 + contentY, truncTitle.c_str(), true, EpdFontFamily::BOLD);
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, title.c_str());
 
-  // Progress summary
   std::string progressLine;
   if (totalPages > 0) {
-    progressLine = "Chapter: " + std::to_string(currentPage) + "/" + std::to_string(totalPages) + " pages  |  ";
+    progressLine = "本章: " + std::to_string(currentPage) + "/" + std::to_string(totalPages) + " pages  |  ";
   }
-  progressLine += "Book: " + std::to_string(bookProgressPercent) + "%";
-  renderer.drawCenteredText(UI_10_FONT_ID, 45, progressLine.c_str());
+  progressLine += "全书: " + std::to_string(bookProgressPercent) + "%";
 
-  // Menu Items
-  const int startY = 75 + contentY;
-  constexpr int lineHeight = 30;
+  const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
+  const int progressBoxX = metrics.contentSidePadding;
+  const int progressBoxY = contentTop - metrics.verticalSpacing + 1;
+  const int progressBoxWidth = pageWidth - metrics.contentSidePadding * 2;
+  const int progressBoxHeight = renderer.getLineHeight(UI_10_FONT_ID) + 10;
 
-  for (size_t i = 0; i < menuItems.size(); ++i) {
-    const int displayY = startY + (i * lineHeight);
-    const bool isSelected = (static_cast<int>(i) == selectedIndex);
+  // Draw progress as a dedicated info strip so the menu hierarchy matches Lyra's card-like sections.
+  renderer.drawCenteredText(UI_10_FONT_ID, progressBoxY + 5, progressLine.c_str());
 
-    if (isSelected) {
-      // Highlight only the content area so we don't paint over hint gutters.
-      renderer.fillRect(contentX, displayY, contentWidth - 1, lineHeight, true);
-    }
+  const int listTop = progressBoxY + progressBoxHeight + metrics.verticalSpacing;
+  const int listHeight =
+      std::max(0, pageHeight - listTop - metrics.buttonHintsHeight - metrics.verticalSpacing);
 
-    renderer.drawText(UI_10_FONT_ID, contentX + 20, displayY, menuItems[i].label.c_str(), !isSelected);
-
-    if (menuItems[i].action == MenuAction::ROTATE_SCREEN) {
-      // Render current orientation value on the right edge of the content area.
-      const auto value = orientationLabels[pendingOrientation];
-      const auto width = renderer.getTextWidth(UI_10_FONT_ID, value);
-      renderer.drawText(UI_10_FONT_ID, contentX + contentWidth - 20 - width, displayY, value, !isSelected);
-    }
-  }
+  GUI.drawList(
+      renderer, Rect{0, listTop, pageWidth, listHeight}, static_cast<int>(menuItems.size()), selectedIndex,
+      [this](int index) { return menuItems[index].label; }, nullptr, nullptr,
+      [this](int index) {
+        if (menuItems[index].action == MenuAction::ROTATE_SCREEN) {
+          return std::string(orientationLabels[pendingOrientation]);
+        }
+        if (menuItems[index].action == MenuAction::AUTO_PAGE_TURN_TOGGLE) {
+          return std::string(SETTINGS.autoPageTurn ? "开启" : "关闭");
+        }
+        if (menuItems[index].action == MenuAction::AUTO_PAGE_TURN_TIME) {
+          const uint8_t seconds = clampAutoPageTurnSeconds(SETTINGS.autoPageTurnTime);
+          return std::to_string(seconds) + "s";
+        }
+        return std::string();
+      });
 
   // Footer / Hints
   const auto labels = mappedInput.mapLabels("« 返回", "选择", "向上", "向下");

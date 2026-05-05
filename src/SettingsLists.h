@@ -55,13 +55,14 @@ inline std::vector<SettingInfo> getSettingsList() {
                         {"上, 下", "下, 上"}, "sideButtonLayout", "Controls"),
       SettingInfo::Toggle("长按跳章节", &CrossPointSettings::longPressChapterSkip, "longPressChapterSkip",
                           "Controls"),
-      SettingInfo::Enum("短按电源键", &CrossPointSettings::shortPwrBtn, {"忽略", "休眠", "翻页"},
+      SettingInfo::Enum("短按电源键", &CrossPointSettings::shortPwrBtn,
+            {"忽略", "休眠", "翻页", "全刷", "截屏", "wifi传书"},
                         "shortPwrBtn", "Controls"),
 
       // --- System ---
       SettingInfo::Enum("休眠时间", &CrossPointSettings::sleepTimeout,
                         {"1 min", "5 min", "10 min", "15 min", "30 min"}, "sleepTimeout", "System"),
-      //SettingInfo::Toggle("bluetoothEnabled", &CrossPointSettings::bluetoothEnabled, "bluetoothEnabled", "System"),
+      SettingInfo::Toggle("bluetoothEnabled", &CrossPointSettings::bluetoothEnabled, "bluetoothEnabled", "System"),
 
       // --- KOReader Sync (web-only, uses KOReaderCredentialStore) ---
       SettingInfo::DynamicString(

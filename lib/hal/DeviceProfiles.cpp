@@ -4,6 +4,11 @@
 #include <HardwareSerial.h>
 namespace DeviceProfiles {
 
+namespace {
+DeviceProfile CUSTOM_PROFILE = {"Custom Mapping", nullptr, STANDARD_PAGE_UP, STANDARD_PAGE_DOWN, false, 2};
+bool HAS_CUSTOM_PROFILE = false;
+}
+
 const DeviceProfile* findDeviceProfile(const char* macAddress, const char* deviceName) {
   // First, try to find by MAC address prefix (case-insensitive comparison)
   if (macAddress) {
@@ -53,8 +58,13 @@ const DeviceProfile* findDeviceProfile(const char* macAddress, const char* devic
           strstr(deviceName, "GAME")) {
         if (strstr(deviceName, "Brick") || strstr(deviceName, "brick") || 
             strstr(deviceName, "BRICK")) {
-          Serial.printf("DEV", "✓ Matched GameBrick by name pattern: %s -> IINE Game Brick", deviceName);
-          return &KNOWN_DEVICES[0];  // Return GameBrick profile
+          for (int j = 0; j < KNOWN_DEVICES_COUNT; ++j) {
+            if (strstr(KNOWN_DEVICES[j].name, "Game") != nullptr) {
+              Serial.printf("DEV", "✓ Matched GameBrick by name pattern: %s -> %s", deviceName,
+                            KNOWN_DEVICES[j].name);
+              return &KNOWN_DEVICES[j];
+            }
+          }
         }
       }
       
@@ -63,8 +73,14 @@ const DeviceProfile* findDeviceProfile(const char* macAddress, const char* devic
           strstr(deviceName, "Mini")) {
         if (strstr(deviceName, "KEYBOARD") || strstr(deviceName, "keyboard") || 
             strstr(deviceName, "Keyboard")) {
-          Serial.printf("DEV", "✓ Matched MINI_KEYBOARD by name pattern: %s", deviceName);
-          return &KNOWN_DEVICES[1];  // Return MINI_KEYBOARD profile
+          for (int j = 0; j < KNOWN_DEVICES_COUNT; ++j) {
+            if (strstr(KNOWN_DEVICES[j].name, "KEYBOARD") != nullptr ||
+                strstr(KNOWN_DEVICES[j].name, "Keyboard") != nullptr) {
+              Serial.printf("DEV", "✓ Matched MINI_KEYBOARD by name pattern: %s -> %s", deviceName,
+                            KNOWN_DEVICES[j].name);
+              return &KNOWN_DEVICES[j];
+            }
+          }
         }
       }
     }
@@ -81,18 +97,20 @@ bool isStandardConsumerPageCode(uint8_t code) {
 }
 
 const DeviceProfile* getCustomProfile() {
-  // TODO: Implement settings persistence for custom profiles
-  // For now, return nullptr (no custom profile set)
-  return nullptr;
+  return HAS_CUSTOM_PROFILE ? &CUSTOM_PROFILE : nullptr;
 }
 
 void setCustomProfile(uint8_t pageUpCode, uint8_t pageDownCode, uint8_t reportByteIndex) {
-  // TODO: Implement settings persistence for custom profiles
+  CUSTOM_PROFILE.pageUpCode = pageUpCode;
+  CUSTOM_PROFILE.pageDownCode = pageDownCode;
+  CUSTOM_PROFILE.reportByteIndex = reportByteIndex;
+  CUSTOM_PROFILE.isConsumerPage = false;
+  HAS_CUSTOM_PROFILE = true;
   Serial.printf("DEV", "Custom profile set: up=0x%02X down=0x%02X byte=%d", pageUpCode, pageDownCode, reportByteIndex);
 }
 
 void clearCustomProfile() {
-  // TODO: Implement settings clearing
+  HAS_CUSTOM_PROFILE = false;
   Serial.printf("DEV", "Custom profile cleared");
 }
 

@@ -10,19 +10,50 @@
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <SDCardManager.h>
+#include <BluetoothHIDManager.h>
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
 #include "RecentBooksStore.h"
+#include "BookmarkActivity.h"
+#include "ReaderEntryModeSelectionActivity.h"
+#include "XtcBookmarkSelectionActivity.h"
 #include "XtcReaderChapterSelectionActivity.h"
+#include "../settings/BluetoothSettingsActivity.h"
+#include "../../util/ReaderBluetoothBootstrap.h"
 #include "fontIds.h"
 #include "../../lib/Xtc/Xtc/XtcTypes.h"
 
 namespace {
 constexpr unsigned long skipPageMs = 700;
 constexpr unsigned long goHomeMs = 1000;
+constexpr unsigned long bookmarkPressMs = 700;
 constexpr int loadedMaxPage_per= 500;//新增
+
+uint8_t clampAutoPageTurnSeconds(const uint8_t seconds) {
+  if (seconds < CrossPointSettings::AUTO_PAGE_TURN_TIME_MIN) {
+    return CrossPointSettings::AUTO_PAGE_TURN_TIME_MIN;
+  }
+  if (seconds > CrossPointSettings::AUTO_PAGE_TURN_TIME_MAX) {
+    return CrossPointSettings::AUTO_PAGE_TURN_TIME_MAX;
+  }
+  return seconds;
+}
+
+bool shouldTriggerAutoPageTurn(unsigned long& lastTriggerMs) {
+  const unsigned long now = millis();
+  if (!SETTINGS.autoPageTurn) {
+    lastTriggerMs = now;
+    return false;
+  }
+  const uint8_t seconds = clampAutoPageTurnSeconds(SETTINGS.autoPageTurnTime);
+  if (now - lastTriggerMs >= static_cast<unsigned long>(seconds) * 1000UL) {
+    lastTriggerMs = now;
+    return true;
+  }
+  return false;
+}
 }  // namespace
 
 void XtcReaderActivity::taskTrampoline(void* param) {
@@ -56,6 +87,7 @@ void XtcReaderActivity::onEnter() {
 
   // Trigger first update
   updateRequired = true;
+  lastAutoPageTurnMs = millis();
 
   xTaskCreate(&XtcReaderActivity::taskTrampoline, "XtcReaderActivityTask",
               4096,               // Stack size (smaller than EPUB since no parsing needed)
@@ -67,6 +99,12 @@ void XtcReaderActivity::onEnter() {
 
 void XtcReaderActivity::onExit() {
   ActivityWithSubactivity::onExit();
+
+  // Force-release BLE resources when leaving reader to maximize memory for parsing/rendering.
+  auto& btMgr = BluetoothHIDManager::getInstance();
+  if (btMgr.isEnabled()) {
+    btMgr.disable();
+  }
 
   // Wait until not rendering to delete task
   xSemaphoreTake(renderingMutex, portMAX_DELAY);
@@ -90,28 +128,90 @@ void XtcReaderActivity::onExit() {
 void XtcReaderActivity::loop() {
   // Pass input responsibility to sub activity if exists
   if (subActivity) {
+    lastAutoPageTurnMs = millis();
     subActivity->loop();
     return;
   }
 
-  // Enter chapter selection activity
+  if (skipNextButtonCheck) {
+    lastAutoPageTurnMs = millis();
+    const bool confirmCleared = !mappedInput.isPressed(MappedInputManager::Button::Confirm) &&
+                                !mappedInput.wasReleased(MappedInputManager::Button::Confirm);
+    const bool backCleared = !mappedInput.isPressed(MappedInputManager::Button::Back) &&
+                             !mappedInput.wasReleased(MappedInputManager::Button::Back);
+    if (confirmCleared && backCleared) {
+      skipNextButtonCheck = false;
+    }
+    return;
+  }
+
+  // Short confirm opens mode selector (chapter/bookmark)
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    {
+    if (mappedInput.getHeldTime() >= bookmarkPressMs) {
+      const int totalPages = static_cast<int>(xtc->getPageCount());
+      const int percent = totalPages > 0
+                              ? static_cast<int>(((static_cast<float>(currentPage + 1) * 100.0f) /
+                                                   static_cast<float>(totalPages)) +
+                                                  0.5f)
+                              : 0;
       xSemaphoreTake(renderingMutex, portMAX_DELAY);
       exitActivity();
-      enterNewActivity(new XtcReaderChapterSelectionActivity(
-          this->renderer, this->mappedInput, xtc, currentPage,
-          [this] {
-            exitActivity();
-            updateRequired = true;
-          },
-          [this](const uint32_t newPage) {
-            this->gotoPage(newPage);
+      enterNewActivity(new BookmarkActivity(
+          renderer, mappedInput, xtc->getPath(), xtc->getCachePath(), std::max(0, std::min(100, percent)),
+          static_cast<int32_t>(currentPage), totalPages, static_cast<int32_t>(m_loadedMax), [this](bool) {
             exitActivity();
             updateRequired = true;
           }));
       xSemaphoreGive(renderingMutex);
+      return;
     }
+
+    xSemaphoreTake(renderingMutex, portMAX_DELAY);
+    exitActivity();
+    enterNewActivity(new ReaderEntryModeSelectionActivity(
+        this->renderer, this->mappedInput,
+        [this]() {
+          exitActivity();
+          updateRequired = true;
+        },
+        [this](ReaderEntryModeSelectionActivity::Mode mode) {
+          exitActivity();
+          if (mode == ReaderEntryModeSelectionActivity::Mode::CHAPTER) {
+            enterNewActivity(new XtcReaderChapterSelectionActivity(
+                this->renderer, this->mappedInput, xtc, currentPage,
+                [this] {
+                  exitActivity();
+                  updateRequired = true;
+                },
+                [this](const uint32_t newPage) {
+                  this->gotoPage(newPage);
+                  exitActivity();
+                  updateRequired = true;
+                }));
+          } else if (mode == ReaderEntryModeSelectionActivity::Mode::BOOKMARK) {
+            enterNewActivity(new XtcBookmarkSelectionActivity(
+                this->renderer, this->mappedInput, xtc,
+                [this]() {
+                  exitActivity();
+                  updateRequired = true;
+                },
+                [this](const uint32_t newPage) {
+                  this->gotoPage(newPage);
+                  exitActivity();
+                  updateRequired = true;
+                }));
+          } else if (mode == ReaderEntryModeSelectionActivity::Mode::BLUETOOTH) {
+            enterNewActivity(new BluetoothSettingsActivity(
+                this->renderer, this->mappedInput,
+                [this] {
+                  exitActivity();
+                  skipNextButtonCheck = true;
+                  updateRequired = true;
+                }));
+          }
+        }));
+    xSemaphoreGive(renderingMutex);
+    return;
   }
 
   // Long press BACK (1s+) goes directly to home
@@ -134,11 +234,12 @@ void XtcReaderActivity::loop() {
                                                     mappedInput.wasReleased(MappedInputManager::Button::Left));
   const bool powerPageTurn = SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PAGE_TURN &&
                              mappedInput.wasReleased(MappedInputManager::Button::Power);
+    const bool autoTurnTriggered = shouldTriggerAutoPageTurn(lastAutoPageTurnMs);
   const bool nextTriggered = usePressForPageTurn
                                  ? (mappedInput.wasPressed(MappedInputManager::Button::PageForward) || powerPageTurn ||
-                                    mappedInput.wasPressed(MappedInputManager::Button::Right))
+                          mappedInput.wasPressed(MappedInputManager::Button::Right) || autoTurnTriggered)
                                  : (mappedInput.wasReleased(MappedInputManager::Button::PageForward) || powerPageTurn ||
-                                    mappedInput.wasReleased(MappedInputManager::Button::Right));
+                          mappedInput.wasReleased(MappedInputManager::Button::Right) || autoTurnTriggered);
 
   if (!prevTriggered && !nextTriggered) {
     return;
@@ -146,6 +247,9 @@ void XtcReaderActivity::loop() {
 
   // Handle end of book
   if (currentPage >= xtc->getPageCount()) {
+    if (autoTurnTriggered) {
+      return;
+    }
     currentPage = xtc->getPageCount() - 1;
     updateRequired = true;
     return;
@@ -155,6 +259,7 @@ void XtcReaderActivity::loop() {
   const int skipAmount = skipPages ? 10 : 1;
 
   if (prevTriggered) {
+    lastAutoPageTurnMs = millis();
     if (currentPage >= static_cast<uint32_t>(skipAmount)) {
       currentPage -= skipAmount;
     } else {
@@ -162,6 +267,9 @@ void XtcReaderActivity::loop() {
     }
     updateRequired = true;
   } else if (nextTriggered) {
+    if (!autoTurnTriggered) {
+      lastAutoPageTurnMs = millis();
+    }
     currentPage += skipAmount;
     if (currentPage >= xtc->getPageCount()) {
       currentPage = xtc->getPageCount();  // Allow showing "End of book"
@@ -197,6 +305,11 @@ void XtcReaderActivity::renderScreen() {
 
   renderFullPage(); // 替换为新的批量渲染函数
   saveProgress();
+
+  if (!bluetoothBootstrapDone) {
+    bluetoothBootstrapDone = true;
+    initializeBluetoothAfterReaderRender();
+  }
 }
 
 // 核心：半页内存 + 批量渲染（完全对齐原始renderPage逻辑）

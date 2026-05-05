@@ -323,6 +323,7 @@
       background-color: #d68910;
     }
     /* Action button styles */
+    .download-btn,
     .delete-btn,
     .rename-btn,
     .move-btn {
@@ -333,6 +334,12 @@
       padding: 4px 8px;
       border-radius: 4px;
       transition: all 0.15s;
+    }
+    .download-btn {
+      color: #27ae60;
+    }
+    .download-btn:hover {
+      background-color: #e8f6e9;
     }
     .delete-btn {
       color: #95a5a6;
@@ -354,7 +361,7 @@
       background-color: #e6f7f4;
     }
     .actions-col {
-      width: 140px;
+      width: 170px;
       text-align: center;
     }
     .action-icon-group {
@@ -606,8 +613,9 @@
         font-size: 1.1em;
       }
       .actions-col {
-        width: 120px;
+        width: 150px;
       }
+      .download-btn,
       .delete-btn,
       .rename-btn,
       .move-btn {
@@ -870,6 +878,7 @@
           fileTableContent += `<td>${file.name.split('.').pop().toUpperCase()}</td>`;
           fileTableContent += `<td>${formatFileSize(file.size)}</td>`;
           fileTableContent += `<td class="actions-col"><div class="action-icon-group">`;
+          fileTableContent += `<button class="download-btn" onclick="downloadFile('${filePath.replaceAll("'", "\\'")}', '${file.name.replaceAll("'", "\\'")}')" title="Download file">⬇️</button>`;
           fileTableContent += `<button class="move-btn" onclick="openMoveModal('${file.name.replaceAll("'", "\\'")}', '${filePath.replaceAll("'", "\\'")}' )" title="Move file">📂</button>`;
           fileTableContent += `<button class="rename-btn" onclick="openRenameModal('${file.name.replaceAll("'", "\\'")}', '${filePath.replaceAll("'", "\\'")}' )" title="Rename file">✏️</button>`;
           fileTableContent += `<button class="delete-btn" onclick="openDeleteModal('${file.name.replaceAll("'", "\\'")}', '${filePath.replaceAll("'", "\\'")}', false)" title="Delete file">🗑️</button>`;
@@ -905,6 +914,18 @@
     if (!hasNextPage) return;
     currentPage++;
     hydrate();
+  }
+
+  function downloadFile(path, fileName) {
+    if (!path) return;
+    const anchor = document.createElement('a');
+    anchor.href = '/download?path=' + encodeURIComponent(path);
+    if (fileName) {
+      anchor.download = fileName;
+    }
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
   }
 
   // Modal functions

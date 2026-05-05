@@ -11,7 +11,15 @@ class BluetoothSettingsActivity : public Activity {
  private:
   enum class ViewMode {
     MAIN_MENU,
-    DEVICE_LIST
+    DEVICE_LIST,
+    KEY_MAPPING
+  };
+
+  enum class MappingStep {
+    WAIT_START_CONFIRM,
+    WAIT_PREV,
+    WAIT_NEXT,
+    DONE
   };
 
   ViewMode viewMode = ViewMode::MAIN_MENU;
@@ -19,6 +27,12 @@ class BluetoothSettingsActivity : public Activity {
   BluetoothHIDManager* btMgr = nullptr;
   std::string lastError = "";
   unsigned long lastScanTime = 0;
+  MappingStep mappingStep = MappingStep::WAIT_PREV;
+  uint8_t mappedPrevKey = 0x00;
+  uint8_t mappedNextKey = 0x00;
+  uint8_t mappedPrevByte = 0xFF;
+  uint8_t mappedNextByte = 0xFF;
+  bool mappingCaptureArmed = false;
 
  public:
   explicit BluetoothSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -38,8 +52,11 @@ class BluetoothSettingsActivity : public Activity {
   void render();
   void handleMainMenuInput();
   void handleDeviceListInput();
+  void handleKeyMappingInput();
+  void beginKeyMappingCapture();
   void renderMainMenu();
   void renderDeviceList();
+  void renderKeyMapping();
   std::string getSignalStrengthIndicator(const int32_t rssi) const;
   
   const std::function<void()> onComplete;

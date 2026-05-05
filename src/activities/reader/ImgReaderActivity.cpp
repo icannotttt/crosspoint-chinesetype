@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 
@@ -28,6 +29,51 @@ constexpr char TRANSPARENT_WHITE_TMP[] = "/.crosspoint/.transparent_white.tmp";
 constexpr char CUSTOM_SLEEP_BMP[] = "/sleep.bmp";
 constexpr char CUSTOM_SLEEP_PXC[] = "/.crosspoint/custom_sleep.pxc";
 constexpr int IMAGE_NEARBY_WINDOW = 2;
+
+bool caseInsensitiveLess(const std::string& lhs, const std::string& rhs) {
+  return std::lexicographical_compare(
+      lhs.begin(), lhs.end(), rhs.begin(), rhs.end(),
+      [](const char a, const char b) { return std::tolower(static_cast<unsigned char>(a)) < std::tolower(static_cast<unsigned char>(b)); });
+}
+
+std::vector<std::string> collectSortedImagePaths(const std::string& folderPath) {
+  std::vector<std::string> imagePaths;
+
+  auto dir = SdMan.open(folderPath.c_str());
+  if (!dir || !dir.isDirectory()) {
+    if (dir) {
+      dir.close();
+    }
+    return imagePaths;
+  }
+
+  char name[256];
+  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
+    if (file.isDirectory()) {
+      file.close();
+      continue;
+    }
+
+    file.getName(name, sizeof(name));
+    const std::string fileName = name;
+    if (fileName.empty() || fileName[0] == '.') {
+      file.close();
+      continue;
+    }
+
+    if (StringUtils::checkFileExtension(fileName, ".png") || StringUtils::checkFileExtension(fileName, ".jpg") ||
+        StringUtils::checkFileExtension(fileName, ".jpeg") || StringUtils::checkFileExtension(fileName, ".bmp")) {
+      const std::string fullPath = (folderPath == "/") ? ("/" + fileName) : (folderPath + "/" + fileName);
+      imagePaths.push_back(fullPath);
+    }
+
+    file.close();
+  }
+
+  dir.close();
+  std::sort(imagePaths.begin(), imagePaths.end(), caseInsensitiveLess);
+  return imagePaths;
+}
 
 void logTransparentWallpaperMem(const char* stage) {
   Serial.printf("[%lu] [IMG] [TPAPER] %s | freeHeap=%u minFreeHeap=%u\n", millis(), stage, ESP.getFreeHeap(),
@@ -157,12 +203,12 @@ void ImgReaderActivity::loop() {
   }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Back) && mappedInput.getHeldTime() < goHomeMs) {
-    onGoBack();
+    onGoBack(imagePath);
     return;
   }
 }
 
-void ImgReaderActivity::renderImage() {
+bool ImgReaderActivity::renderImage() {
   bool ok = false;
   switch (imageType) {
     case ImageType::PNG:
@@ -184,6 +230,8 @@ void ImgReaderActivity::renderImage() {
     renderer.drawCenteredText(UI_12_FONT_ID, 300, "Image load failed", true, EpdFontFamily::BOLD);
     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
   }
+
+  return ok;
 }
 
 void ImgReaderActivity::renderMenuOverlay() const {
@@ -241,6 +289,7 @@ bool ImgReaderActivity::saveFrameBufferAsPxc(const std::string& pxcPath) const {
     const size_t bytesWritten = output.write(frameBuffer + written, toWrite);
     if (bytesWritten != toWrite) {
       output.close();
+      SdMan.remove(pxcPath.c_str());
       return false;
     }
     written += bytesWritten;
@@ -367,6 +416,7 @@ bool ImgReaderActivity::saveTransparentOverlayPxaFromPng(const std::string& pngP
       output.close();
       whiteTmpInput.close();
       SdMan.remove(TRANSPARENT_WHITE_TMP);
+      SdMan.remove(pxaPath.c_str());
       return false;
     }
 
@@ -376,6 +426,7 @@ bool ImgReaderActivity::saveTransparentOverlayPxaFromPng(const std::string& pngP
       output.close();
       whiteTmpInput.close();
       SdMan.remove(TRANSPARENT_WHITE_TMP);
+      SdMan.remove(pxaPath.c_str());
       return false;
     }
 
@@ -387,6 +438,7 @@ bool ImgReaderActivity::saveTransparentOverlayPxaFromPng(const std::string& pngP
     output.close();
     whiteTmpInput.close();
     SdMan.remove(TRANSPARENT_WHITE_TMP);
+    SdMan.remove(pxaPath.c_str());
     return false;
   }
 
@@ -399,6 +451,7 @@ bool ImgReaderActivity::saveTransparentOverlayPxaFromPng(const std::string& pngP
       output.close();
       whiteTmpInput.close();
       SdMan.remove(TRANSPARENT_WHITE_TMP);
+      SdMan.remove(pxaPath.c_str());
       return false;
     }
 
@@ -413,6 +466,7 @@ bool ImgReaderActivity::saveTransparentOverlayPxaFromPng(const std::string& pngP
       output.close();
       whiteTmpInput.close();
       SdMan.remove(TRANSPARENT_WHITE_TMP);
+      SdMan.remove(pxaPath.c_str());
       return false;
     }
 
@@ -501,9 +555,9 @@ bool ImgReaderActivity::setAsReadingBackground() {
 
   const auto originalOrientation = renderer.getOrientation();
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
-  renderImage();
+  const bool rendered = renderImage();
 
-  const bool pxcSaved = saveFrameBufferAsPxc(READING_BG_PXC);
+  const bool pxcSaved = rendered && saveFrameBufferAsPxc(READING_BG_PXC);
   renderer.setOrientation(originalOrientation);
 
   if (pxcSaved) {
@@ -517,9 +571,14 @@ bool ImgReaderActivity::setAsReadingBackground() {
 bool ImgReaderActivity::setAsCustomSleepScreen() {
   const auto originalOrientation = renderer.getOrientation();
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
-  renderImage();
+  const bool rendered = renderImage();
 
   bool ok = false;
+  if (!rendered) {
+    renderer.setOrientation(originalOrientation);
+    return false;
+  }
+
   if (imageType == ImageType::BMP) {
     ok = saveFrameBufferAs1BitBmp(CUSTOM_SLEEP_BMP);
     if (ok) {
@@ -548,6 +607,11 @@ bool ImgReaderActivity::setAsTransparentWallpaper() {
   }
 
   const bool pxaSaved = saveTransparentOverlayPxaFromPng(imagePath, TRANSPARENT_BG_PXA);
+  if (pxaSaved) {
+    SETTINGS.sleepScreen = CrossPointSettings::SLEEP_SCREEN_MODE::MARSK2;
+    SETTINGS.saveToFile();
+  }
+
   return pxaSaved;
 }
 
@@ -609,48 +673,13 @@ std::string ImgReaderActivity::extractFolderPath() const {
 
 bool ImgReaderActivity::locateCurrentImageInFolder(const std::string& folderPath) {
   currentFolderImageIndex = -1;
-
-  auto dir = SdMan.open(folderPath.c_str());
-  if (!dir || !dir.isDirectory()) {
-    if (dir) {
-      dir.close();
-    }
-    return false;
-  }
-
-  int imageIndex = 0;
-  char name[256];
-  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
-    if (file.isDirectory()) {
-      file.close();
-      continue;
-    }
-
-    file.getName(name, sizeof(name));
-    const std::string fileName = name;
-    if (fileName.empty() || fileName[0] == '.') {
-      file.close();
-      continue;
-    }
-
-    ImageType ignoredType = ImageType::BMP;
-    if (!inferImageType(fileName, ignoredType)) {
-      file.close();
-      continue;
-    }
-
-    const std::string fullPath = (folderPath == "/") ? ("/" + fileName) : (folderPath + "/" + fileName);
-    if (fullPath == imagePath) {
-      currentFolderImageIndex = imageIndex;
-      file.close();
+  const auto sortedImages = collectSortedImagePaths(folderPath);
+  for (size_t i = 0; i < sortedImages.size(); ++i) {
+    if (sortedImages[i] == imagePath) {
+      currentFolderImageIndex = static_cast<int>(i);
       break;
     }
-
-    ++imageIndex;
-    file.close();
   }
-
-  dir.close();
   return currentFolderImageIndex >= 0;
 }
 
@@ -666,51 +695,11 @@ void ImgReaderActivity::rebuildImageWindow(const std::string& folderPath) {
   const int minIndex = std::max(0, currentFolderImageIndex - IMAGE_NEARBY_WINDOW);
   const int maxIndex = currentFolderImageIndex + IMAGE_NEARBY_WINDOW;
   windowStartImageIndex = minIndex;
-
-  auto dir = SdMan.open(folderPath.c_str());
-  if (!dir || !dir.isDirectory()) {
-    if (dir) {
-      dir.close();
-    }
-    return;
+  const auto sortedImages = collectSortedImagePaths(folderPath);
+  const int endIndex = std::min(maxIndex, static_cast<int>(sortedImages.size()) - 1);
+  for (int i = minIndex; i <= endIndex; ++i) {
+    folderImagePaths.push_back(sortedImages[static_cast<size_t>(i)]);
   }
-
-  int imageIndex = 0;
-  char name[256];
-  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
-    if (file.isDirectory()) {
-      file.close();
-      continue;
-    }
-
-    file.getName(name, sizeof(name));
-    const std::string fileName = name;
-    if (fileName.empty() || fileName[0] == '.') {
-      file.close();
-      continue;
-    }
-
-    ImageType ignoredType = ImageType::BMP;
-    if (!inferImageType(fileName, ignoredType)) {
-      file.close();
-      continue;
-    }
-
-    if (imageIndex >= minIndex && imageIndex <= maxIndex) {
-      const std::string fullPath = (folderPath == "/") ? ("/" + fileName) : (folderPath + "/" + fileName);
-      folderImagePaths.push_back(fullPath);
-    }
-
-    if (imageIndex > maxIndex) {
-      file.close();
-      break;
-    }
-
-    ++imageIndex;
-    file.close();
-  }
-
-  dir.close();
 
   const int localIndex = currentFolderImageIndex - windowStartImageIndex;
   if (localIndex >= 0 && localIndex < static_cast<int>(folderImagePaths.size())) {
@@ -724,50 +713,13 @@ bool ImgReaderActivity::resolveImageAtFolderIndex(const std::string& folderPath,
     return false;
   }
 
-  auto dir = SdMan.open(folderPath.c_str());
-  if (!dir || !dir.isDirectory()) {
-    if (dir) {
-      dir.close();
-    }
+  const auto sortedImages = collectSortedImagePaths(folderPath);
+  if (targetIndex >= static_cast<int>(sortedImages.size())) {
     return false;
   }
 
-  int imageIndex = 0;
-  char name[256];
-  bool found = false;
-  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
-    if (file.isDirectory()) {
-      file.close();
-      continue;
-    }
-
-    file.getName(name, sizeof(name));
-    const std::string fileName = name;
-    if (fileName.empty() || fileName[0] == '.') {
-      file.close();
-      continue;
-    }
-
-    ImageType localType = ImageType::BMP;
-    if (!inferImageType(fileName, localType)) {
-      file.close();
-      continue;
-    }
-
-    if (imageIndex == targetIndex) {
-      outType = localType;
-      outPath = (folderPath == "/") ? ("/" + fileName) : (folderPath + "/" + fileName);
-      found = true;
-      file.close();
-      break;
-    }
-
-    ++imageIndex;
-    file.close();
-  }
-
-  dir.close();
-  return found;
+  outPath = sortedImages[static_cast<size_t>(targetIndex)];
+  return inferImageType(outPath, outType);
 }
 
 void ImgReaderActivity::buildFolderImageList() {

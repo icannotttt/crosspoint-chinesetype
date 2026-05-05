@@ -27,19 +27,19 @@ struct DeviceProfile {
 
 // Known device profiles (database of popular page turners)
 constexpr DeviceProfile KNOWN_DEVICES[] = {
-    // IINE Game Brick - specific keycodes in byte[4]
-    // Note: MAC prefix set to nullptr to allow ANY GameBrick device
-    {"IINE Game Brick", nullptr, 0x09, 0x07, false, 4},
+    // // IINE Game Brick - specific keycodes in byte[4]
+    // // Note: MAC prefix set to nullptr to allow ANY GameBrick device
+    // {"IINE Game Brick", nullptr, 0x09, 0x07, false, 4},
     
-    // MINI_KEYBOARD - standard keyboard page codes in byte[2]
-    // Note: MAC prefix set to nullptr to allow ANY compatible keyboard
-    {"MINI_KEYBOARD", nullptr, 0x4B, 0x4E, false, 2},
+    // // MINI_KEYBOARD - standard keyboard page codes in byte[2]
+    // // Note: MAC prefix set to nullptr to allow ANY compatible keyboard
+    // {"MINI_KEYBOARD", nullptr, 0x4B, 0x4E, false, 2},
     
-    // Kobo Elipsa 2E remote (common page turner) - Consumer Page
-    {"Kobo Remote", nullptr, STANDARD_PAGE_UP, STANDARD_PAGE_DOWN, true, 2},
+    // // Kobo Elipsa 2E remote (common page turner) - Consumer Page
+    // {"Kobo Remote", nullptr, STANDARD_PAGE_UP, STANDARD_PAGE_DOWN, true, 2},
     
     // Generic Free2-style device pattern - standard HID Consumer Page
-    {"Free2 Style", nullptr, STANDARD_PAGE_UP, STANDARD_PAGE_DOWN, true, 2},
+    {"suibian", nullptr, STANDARD_PAGE_UP, STANDARD_PAGE_DOWN, true, 2},
 };
 
 constexpr int KNOWN_DEVICES_COUNT = sizeof(KNOWN_DEVICES) / sizeof(KNOWN_DEVICES[0]);
